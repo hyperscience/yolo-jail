@@ -74,27 +74,56 @@ class TestAutoLoadImage:
     @patch("cli._read_loaded_paths", return_value=set())
     @patch("cli._add_loaded_path")
     @patch("cli._estimate_image_size", return_value=100_000_000)
-    def test_streams_image_on_new_path(
+    def test_caches_and_loads_image_on_new_path(
         self, mock_est, mock_add, mock_read, mock_build, tmp_path
     ):
         mock_build.return_value = ("/nix/store/new", [])
 
-        # Mock the streaming pipeline
+        # Mock the streaming to cache file
         stream_proc = MagicMock()
         stream_proc.stdout.read.side_effect = [b"x" * 1024, b""]  # One chunk
         stream_proc.returncode = 0
         stream_proc.wait.return_value = None
 
-        load_proc = MagicMock()
-        load_proc.returncode = 0
-        load_proc.wait.return_value = None
+        load_result = MagicMock(returncode=0, stderr=b"")
 
         with (
             patch("cli.BUILD_DIR", tmp_path),
-            patch("subprocess.Popen", side_effect=[stream_proc, load_proc]),
+            patch("cli.GLOBAL_CACHE", tmp_path / "cache"),
+            patch("subprocess.Popen", return_value=stream_proc),
+            patch("subprocess.run", return_value=load_result),
         ):
             auto_load_image(tmp_path, runtime="docker")
 
+        mock_add.assert_called_once()
+
+    @patch("cli._build_image_store_path")
+    @patch("cli._read_loaded_paths", return_value=set())
+    @patch("cli._add_loaded_path")
+    def test_reuses_cached_tar(self, mock_add, mock_read, mock_build, tmp_path):
+        """When the tar cache file already exists, skip materialization."""
+        mock_build.return_value = ("/nix/store/cached", [])
+
+        # Pre-create the cache file
+        cache_dir = tmp_path / "cache" / "images"
+        cache_dir.mkdir(parents=True)
+        import hashlib
+
+        path_hash = hashlib.sha256(b"/nix/store/cached").hexdigest()[:16]
+        (cache_dir / f"{path_hash}.tar").write_bytes(b"fake tar")
+
+        load_result = MagicMock(returncode=0, stderr=b"")
+
+        with (
+            patch("cli.BUILD_DIR", tmp_path),
+            patch("cli.GLOBAL_CACHE", tmp_path / "cache"),
+            patch("subprocess.Popen") as mock_popen,
+            patch("subprocess.run", return_value=load_result),
+        ):
+            auto_load_image(tmp_path, runtime="docker")
+
+        # Should NOT have streamed (Popen not called for image generation)
+        mock_popen.assert_not_called()
         mock_add.assert_called_once()
 
 
@@ -589,10 +618,10 @@ class TestRunCommandInternals:
     @patch("cli.write_container_tracking")
     @patch("cli._tmux_rename_window")
     @patch("cli._host_mise_dir")
-    @patch("cli._init_per_workspace_mcp_configs")
+    @patch("cli._seed_agent_dir")
     def test_new_container_creation(
         self,
-        mock_init_mcp,
+        mock_seed_agent,
         mock_mise_dir,
         mock_tmux,
         mock_write_track,
@@ -620,6 +649,7 @@ class TestRunCommandInternals:
         agents_dir.mkdir(parents=True)
         (agents_dir / "AGENTS-copilot.md").write_text("test")
         (agents_dir / "AGENTS-gemini.md").write_text("test")
+        (agents_dir / "CLAUDE.md").write_text("test")
         mock_agents.return_value = agents_dir
         monkeypatch.setattr("cli.GLOBAL_STORAGE", tmp_path / "storage")
         (tmp_path / "storage" / "locks").mkdir(parents=True, exist_ok=True)
@@ -694,6 +724,64 @@ class TestRunCommandInternals:
             assert "--yolo" in cmd_str
 
 
+class TestInjectAgentYoloFlags:
+    """``_inject_agent_yolo_flags`` mutates the command in place.  It's
+    the single source of truth for "did we make this agent actually
+    yolo" — testing it directly is faster and more robust than
+    exercising the entire ``yolo run`` attach path through CliRunner."""
+
+    def _inject(self, argv):
+        from cli import _inject_agent_yolo_flags
+
+        cmd = list(argv)
+        _inject_agent_yolo_flags(cmd)
+        return cmd
+
+    def test_claude_gets_dangerously_skip_permissions(self):
+        """YOLO mode is ``--dangerously-skip-permissions``.  The
+        settings.json allow-list that used to serve as "yolo" was
+        half-broken (bare ``"Bash"`` doesn't match invocations); the
+        flag bypasses the permission system entirely.  IS_SANDBOX=1
+        in the jail env suppresses the flag's own launch confirmation
+        so it runs cleanly."""
+        out = self._inject(["claude", "--continue"])
+        assert "--dangerously-skip-permissions" in out
+
+    def test_claude_flag_goes_before_user_args(self):
+        """Flag must land as argv[1] so the rest of the user's args
+        stay in order (Claude parses positional-like options)."""
+        out = self._inject(["claude", "-p", "hello"])
+        assert out[:2] == ["claude", "--dangerously-skip-permissions"]
+
+    def test_claude_does_not_duplicate_dangerously_flag(self):
+        """If the user happened to pass it themselves, don't duplicate
+        — Claude rejects the duplicate with a clear error."""
+        out = self._inject(["claude", "--dangerously-skip-permissions"])
+        assert out.count("--dangerously-skip-permissions") == 1
+
+    def test_non_claude_command_left_alone(self):
+        """Plain bash / ls / anything-else must not get the flag."""
+        for argv in (
+            ["bash", "-lc", "true"],
+            ["ls", "-la"],
+            ["python", "-c", "print(1)"],
+        ):
+            out = self._inject(argv)
+            assert "--dangerously-skip-permissions" not in out
+
+    def test_gemini_and_copilot_yolo_preserved(self):
+        """Regression-safety for the existing gemini/copilot behavior."""
+        assert "--yolo" in self._inject(["gemini"])
+        copilot = self._inject(["copilot"])
+        assert "--yolo" in copilot
+        assert "--no-auto-update" in copilot
+
+    def test_empty_command_no_crash(self):
+        """Defensive — empty list must be a no-op, not IndexError."""
+        out = self._inject([])
+        assert out == []
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test: _resolve_repo_root (installed package path)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -727,6 +815,85 @@ class TestResolveRepoRootInstalled:
             assert result == build_root.resolve()
             assert (build_root / "flake.nix").exists()
             assert (build_root / "src").exists()
+        finally:
+            cli.__file__ = original_file
+
+    def test_installed_package_path_is_idempotent(self, tmp_path, monkeypatch):
+        """Regression: every ``yolo`` invocation was re-copying the
+        package into nix-build-root via an atomic rename dance.  If
+        something raced or failed mid-copy, the resulting build_root
+        could be empty (bug 6 in the handoff).  The copy should be
+        a no-op when the existing build_root already matches the
+        wheel's flake.nix mtime."""
+        from cli import _resolve_repo_root
+
+        monkeypatch.delenv("YOLO_REPO_ROOT", raising=False)
+
+        pkg_dir = tmp_path / "pkg" / "src"
+        pkg_dir.mkdir(parents=True)
+        (pkg_dir / "flake.nix").write_text("{ }")
+        (pkg_dir / "flake.lock").write_text("{}")
+        (pkg_dir / "entrypoint.py").write_text("")
+        (pkg_dir / "cli.py").write_text("")
+
+        build_root = tmp_path / "storage" / "nix-build-root"
+        monkeypatch.setattr("cli.GLOBAL_STORAGE", tmp_path / "storage")
+
+        import cli
+
+        original_file = cli.__file__
+        try:
+            cli.__file__ = str(pkg_dir / "cli.py")
+
+            # First call: populates build_root.
+            _resolve_repo_root()
+            assert (build_root / "src" / "cli.py").exists()
+            first_mtime = (build_root / "flake.nix").stat().st_mtime_ns
+            first_inode = (build_root / "src" / "cli.py").stat().st_ino
+
+            # Second call: should be a no-op.  Build root should be
+            # the SAME directory — not replaced via atomic rename —
+            # so inode is preserved and mtime is unchanged.
+            _resolve_repo_root()
+            second_inode = (build_root / "src" / "cli.py").stat().st_ino
+            second_mtime = (build_root / "flake.nix").stat().st_mtime_ns
+            assert second_inode == first_inode, (
+                "second call should reuse existing build_root, not recreate"
+            )
+            assert second_mtime == first_mtime
+        finally:
+            cli.__file__ = original_file
+
+    def test_installed_package_path_recovers_from_empty_build_root(
+        self, tmp_path, monkeypatch
+    ):
+        """If a prior invocation left build_root empty (bug 6), the
+        next call should detect that and re-populate — not silently
+        return an empty path that'd make the jail unusable."""
+        from cli import _resolve_repo_root
+
+        monkeypatch.delenv("YOLO_REPO_ROOT", raising=False)
+
+        pkg_dir = tmp_path / "pkg" / "src"
+        pkg_dir.mkdir(parents=True)
+        (pkg_dir / "flake.nix").write_text("{ }")
+        (pkg_dir / "flake.lock").write_text("{}")
+        (pkg_dir / "entrypoint.py").write_text("")
+        (pkg_dir / "cli.py").write_text("")
+
+        build_root = tmp_path / "storage" / "nix-build-root"
+        # Simulate the empty-dir bug: build_root exists but has no content.
+        build_root.mkdir(parents=True)
+        monkeypatch.setattr("cli.GLOBAL_STORAGE", tmp_path / "storage")
+
+        import cli
+
+        original_file = cli.__file__
+        try:
+            cli.__file__ = str(pkg_dir / "cli.py")
+            _resolve_repo_root()
+            assert (build_root / "flake.nix").is_file()
+            assert (build_root / "src" / "cli.py").is_file()
         finally:
             cli.__file__ = original_file
 
@@ -1247,6 +1414,7 @@ def _check_monkeypatch(monkeypatch, tmp_path, *, create_dirs=True):
     monkeypatch.setattr("cli.AGENTS_DIR", tmp_path / "agents")
     monkeypatch.setattr("cli.BUILD_DIR", tmp_path / "build")
     monkeypatch.setattr("cli.USER_CONFIG_PATH", tmp_path / "user-config.jsonc")
+    monkeypatch.setattr("cli._runtime_is_connectable", lambda rt: True)
     if create_dirs:
         for d in ("home", "mise", "containers", "agents", "build"):
             (tmp_path / d).mkdir()
@@ -1551,6 +1719,8 @@ def _run_monkeypatch(monkeypatch, tmp_path):
     monkeypatch.setattr("cli.AGENTS_DIR", tmp_path / "agents")
     monkeypatch.setattr("cli.BUILD_DIR", tmp_path / "build")
     monkeypatch.setattr("cli.USER_CONFIG_PATH", tmp_path / "user-config.jsonc")
+    monkeypatch.setattr("cli._runtime_is_connectable", lambda rt: True)
+    monkeypatch.setattr("time.sleep", lambda _: None)
     for d in (
         "home",
         "mise",
@@ -2053,6 +2223,155 @@ class TestRunDevicePassthrough:
             assert "--device-cgroup-rule" in docker_cmd
 
 
+class TestRunKvm:
+    """KVM passthrough flag wiring (opt-in via `kvm: true`)."""
+
+    @patch("subprocess.Popen")
+    @patch("cli.auto_load_image")
+    @patch("cli._check_config_changes", return_value=True)
+    @patch("cli.find_running_container", return_value=None)
+    @patch("subprocess.run")
+    @patch("subprocess.check_output")
+    @patch("shutil.which")
+    def test_kvm_disabled_adds_nothing(
+        self,
+        mock_which,
+        mock_check_output,
+        mock_run,
+        mock_find,
+        mock_config_changes,
+        mock_auto_load,
+        mock_popen,
+        tmp_path,
+        monkeypatch,
+    ):
+        _run_monkeypatch(monkeypatch, tmp_path)
+        _mock_runtimes(mock_which)
+        (tmp_path / "yolo-jail.jsonc").write_text("{}")
+        mock_check_output.side_effect = FileNotFoundError
+
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        runner = CliRunner()
+        runner.invoke(app, ["run", "--", "bash"])
+
+        if mock_popen.called:
+            docker_cmd = mock_popen.call_args[0][0]
+            # No /dev/kvm device, no group-add.
+            assert "/dev/kvm" not in docker_cmd
+            assert "keep-groups" not in docker_cmd
+
+    @patch("subprocess.Popen")
+    @patch("cli.auto_load_image")
+    @patch("cli._check_config_changes", return_value=True)
+    @patch("cli.find_running_container", return_value=None)
+    @patch("subprocess.run")
+    @patch("subprocess.check_output")
+    @patch("shutil.which")
+    def test_kvm_enabled_podman_adds_device_and_keep_groups(
+        self,
+        mock_which,
+        mock_check_output,
+        mock_run,
+        mock_find,
+        mock_config_changes,
+        mock_auto_load,
+        mock_popen,
+        tmp_path,
+        monkeypatch,
+    ):
+        _run_monkeypatch(monkeypatch, tmp_path)
+        _mock_runtimes(mock_which)
+        (tmp_path / "yolo-jail.jsonc").write_text('{"kvm": true}')
+        mock_check_output.side_effect = FileNotFoundError
+
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        # Surgically pretend /dev/kvm exists without affecting other Path.exists
+        # calls in the run path (which there are many of).
+        import cli as _cli
+
+        original_exists = _cli.Path.exists
+
+        def fake_exists(self):
+            if str(self) == "/dev/kvm":
+                return True
+            return original_exists(self)
+
+        with patch.object(_cli.Path, "exists", fake_exists):
+            runner = CliRunner()
+            runner.invoke(app, ["run", "--", "bash"])
+
+        assert mock_popen.called
+        docker_cmd = mock_popen.call_args[0][0]
+        # --device /dev/kvm appears as two consecutive elements.
+        assert "/dev/kvm" in docker_cmd
+        idx = docker_cmd.index("/dev/kvm")
+        assert docker_cmd[idx - 1] == "--device"
+        # Podman path: group-add keep-groups.
+        assert "keep-groups" in docker_cmd
+        ga_idx = docker_cmd.index("keep-groups")
+        assert docker_cmd[ga_idx - 1] == "--group-add"
+
+    @patch("subprocess.Popen")
+    @patch("cli.auto_load_image")
+    @patch("cli._check_config_changes", return_value=True)
+    @patch("cli.find_running_container", return_value=None)
+    @patch("subprocess.run")
+    @patch("subprocess.check_output")
+    @patch("shutil.which")
+    def test_kvm_enabled_but_device_missing_warns_and_skips(
+        self,
+        mock_which,
+        mock_check_output,
+        mock_run,
+        mock_find,
+        mock_config_changes,
+        mock_auto_load,
+        mock_popen,
+        tmp_path,
+        monkeypatch,
+    ):
+        _run_monkeypatch(monkeypatch, tmp_path)
+        _mock_runtimes(mock_which)
+        (tmp_path / "yolo-jail.jsonc").write_text('{"kvm": true}')
+        mock_check_output.side_effect = FileNotFoundError
+
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        # Pretend /dev/kvm is absent even if it's actually present on the
+        # test runner (covers both host situations deterministically).
+        import cli as _cli
+
+        original_exists = _cli.Path.exists
+
+        def fake_exists(self):
+            if str(self) == "/dev/kvm":
+                return False
+            return original_exists(self)
+
+        with patch.object(_cli.Path, "exists", fake_exists):
+            runner = CliRunner()
+            result = runner.invoke(app, ["run", "--", "bash"])
+
+        # Container still launches; just no kvm flags.
+        assert mock_popen.called
+        docker_cmd = mock_popen.call_args[0][0]
+        assert "/dev/kvm" not in docker_cmd
+        assert "keep-groups" not in docker_cmd
+        # A warn is printed on the way through.
+        assert "kvm" in result.output.lower()
+
+
 class TestRunProfile:
     """Test run() with --profile flag."""
 
@@ -2176,66 +2495,35 @@ class TestGenerateAgentsMdEdges:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Test: _init_per_workspace_mcp_configs
+# Test: _seed_agent_dir
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-class TestInitPerWorkspaceMcpConfigs:
-    """Test _init_per_workspace_mcp_configs creates/seeds config files."""
+class TestSeedAgentDirCommands:
+    """Test _seed_agent_dir seeds auth files from GLOBAL_HOME into per-workspace overlay."""
 
-    def test_creates_fresh_configs(self, tmp_path, monkeypatch):
-        from cli import _init_per_workspace_mcp_configs
+    def test_seeds_auth_files(self, tmp_path):
+        from cli import _seed_agent_dir
 
-        monkeypatch.setattr("cli.GLOBAL_HOME", tmp_path / "global-home")
-        ws_state = tmp_path / "ws-state"
-        ws_state.mkdir()
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "hosts.json").write_text('{"token": "x"}')
+        dst = tmp_path / "dst"
+        dst.mkdir()
+        _seed_agent_dir(src, dst)
+        assert (dst / "hosts.json").read_text() == '{"token": "x"}'
 
-        _init_per_workspace_mcp_configs(ws_state)
+    def test_does_not_overwrite_existing(self, tmp_path):
+        from cli import _seed_agent_dir
 
-        assert (ws_state / "copilot-mcp-config.json").exists()
-        assert (ws_state / "copilot-lsp-config.json").exists()
-        assert (ws_state / "gemini-settings.json").exists()
-        assert (ws_state / "gemini-managed-mcp.json").exists()
-
-    def test_seeds_from_shared_gemini_settings(self, tmp_path, monkeypatch):
-        from cli import _init_per_workspace_mcp_configs
-
-        global_home = tmp_path / "global-home"
-        monkeypatch.setattr("cli.GLOBAL_HOME", global_home)
-
-        # Create shared gemini settings with mcpServers that should be stripped
-        gemini_dir = global_home / ".gemini"
-        gemini_dir.mkdir(parents=True)
-        (gemini_dir / "settings.json").write_text(
-            json.dumps(
-                {
-                    "mcpServers": {"test": {"command": "test"}},
-                    "other_setting": True,
-                }
-            )
-        )
-
-        ws_state = tmp_path / "ws-state"
-        ws_state.mkdir()
-        _init_per_workspace_mcp_configs(ws_state)
-
-        data = json.loads((ws_state / "gemini-settings.json").read_text())
-        assert "mcpServers" not in data
-        assert data.get("other_setting") is True
-
-    def test_idempotent_does_not_overwrite(self, tmp_path, monkeypatch):
-        from cli import _init_per_workspace_mcp_configs
-
-        monkeypatch.setattr("cli.GLOBAL_HOME", tmp_path / "global-home")
-        ws_state = tmp_path / "ws-state"
-        ws_state.mkdir()
-
-        # Pre-create with custom content
-        (ws_state / "gemini-settings.json").write_text('{"custom": true}')
-        _init_per_workspace_mcp_configs(ws_state)
-
-        data = json.loads((ws_state / "gemini-settings.json").read_text())
-        assert data.get("custom") is True
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "hosts.json").write_text("old")
+        dst = tmp_path / "dst"
+        dst.mkdir()
+        (dst / "hosts.json").write_text("kept")
+        _seed_agent_dir(src, dst)
+        assert (dst / "hosts.json").read_text() == "kept"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

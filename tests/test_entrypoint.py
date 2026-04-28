@@ -2,6 +2,8 @@
 
 import json
 import os
+import stat
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -24,6 +26,7 @@ def jail_home(tmp_path, monkeypatch):
         "YOLO_BLOCK_CONFIG",
         "YOLO_MISE_TOOLS",
         "YOLO_HOST_DIR",
+        "YOLO_HOST_CLAUDE_FILES",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -40,6 +43,9 @@ def jail_home(tmp_path, monkeypatch):
         "COPILOT_DIR",
         "GEMINI_DIR",
         "GEMINI_MANAGED_MCP_PATH",
+        "CLAUDE_DIR",
+        "CLAUDE_MANAGED_MCP_PATH",
+        "CLAUDE_SHARED_CREDENTIALS_DIR",
         "MISE_CONFIG_DIR",
     ]
     for attr in attrs:
@@ -58,6 +64,11 @@ def jail_home(tmp_path, monkeypatch):
     entrypoint.GEMINI_MANAGED_MCP_PATH = (
         tmp_path / ".gemini" / "yolo-managed-mcp-servers.json"
     )
+    entrypoint.CLAUDE_DIR = tmp_path / ".claude"
+    entrypoint.CLAUDE_MANAGED_MCP_PATH = (
+        tmp_path / ".claude" / "yolo-managed-mcp-servers.json"
+    )
+    entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR = tmp_path / ".claude-shared-credentials"
     entrypoint.MISE_CONFIG_DIR = tmp_path / ".config" / "mise"
 
     yield tmp_path
@@ -70,6 +81,180 @@ def jail_home(tmp_path, monkeypatch):
 
 
 class TestShimGeneration:
+    def _run_shim(self, shim_path, *argv, stdin=b"") -> "subprocess.CompletedProcess":
+        import subprocess as _sp
+
+        return _sp.run(
+            [str(shim_path), *argv],
+            capture_output=True,
+            input=stdin,
+            timeout=5,
+        )
+
+    def test_block_flags_is_config_driven(self, jail_home, monkeypatch):
+        """The smart-block behavior lives in config, not code.  Prove it
+        by supplying custom ``block_flags`` (different from the default
+        grep recursion rule) and confirming:
+
+          - the OLD default patterns (``-r``, ``-R``) pass through (they're
+            not in the user's config)
+          - the user's custom patterns DO block
+        """
+        monkeypatch.setenv(
+            "YOLO_BLOCK_CONFIG",
+            json.dumps(
+                [
+                    {
+                        "name": "grep",
+                        "message": "custom block",
+                        "block_flags": ["--dangerous", "-*[xX]*"],
+                    }
+                ]
+            ),
+        )
+        entrypoint.generate_shims()
+        shim = entrypoint.SHIM_DIR / "grep"
+
+        # ``-r`` is not in the user's custom block_flags — passes through.
+        r = self._run_shim(shim, "-r", "foo", "/dev/null")
+        assert r.returncode != 127, (
+            f"custom block_flags should let -r through, got rc={r.returncode} "
+            f"stderr={r.stderr!r}"
+        )
+        # The user's custom long pattern DOES block.
+        r = self._run_shim(shim, "--dangerous", "foo")
+        assert r.returncode == 127
+        assert b"custom block" in r.stderr
+        # The user's custom short-bundle pattern DOES block.
+        r = self._run_shim(shim, "-xn", "foo", "/dev/null")
+        assert r.returncode == 127
+
+    def test_grep_shim_blocks_only_recursive(self, jail_home, monkeypatch):
+        """grep is blocked *only* when invoked with recursive flags
+        (``-r``, ``-R``, ``--recursive``, short-flag bundles like
+        ``-rn``).  Plain pipe-filter usage must pass through — today's
+        "any grep is blocked" rule fired on ``cmd | grep foo``, which
+        is the wrong call."""
+        monkeypatch.setenv(
+            "YOLO_BLOCK_CONFIG",
+            json.dumps(
+                [
+                    {
+                        "name": "grep",
+                        "message": "grep -r is blocked",
+                        "suggestion": "Use rg",
+                        "block_flags": [
+                            "--recursive",
+                            "-r",
+                            "-R",
+                            "-*[rR]*",
+                        ],
+                    }
+                ]
+            ),
+        )
+        entrypoint.generate_shims()
+        shim = entrypoint.SHIM_DIR / "grep"
+        assert shim.is_file()
+
+        # Recursive — blocked (exit 127).
+        for args in (["-r", "foo", "."], ["-R", "foo", "."], ["--recursive", "foo"]):
+            r = self._run_shim(shim, *args)
+            assert r.returncode == 127, (
+                f"recursive argv {args} should be blocked, got rc={r.returncode}"
+            )
+            assert b"blocked" in r.stderr or b"rg" in r.stderr
+
+        # Short-flag bundles that include r/R — blocked.
+        for args in (["-rn", "foo", "."], ["-Rn", "foo", "."], ["-inRw", "foo"]):
+            r = self._run_shim(shim, *args)
+            assert r.returncode == 127, (
+                f"short-bundle {args} should be blocked, got rc={r.returncode}"
+            )
+
+        # Long flags that happen to contain r/R but are NOT recursive —
+        # not blocked.  The shim must not mistake ``--regex`` or
+        # ``--regexp`` for ``--recursive``.
+        r = self._run_shim(shim, "--regexp=foo", "/dev/null")
+        assert r.returncode != 127, (
+            f"--regexp must not be blocked, got rc={r.returncode} stderr={r.stderr!r}"
+        )
+
+        # Pipe-filter usage — not blocked.  We assert the shim
+        # DIDN'T exit 127 (blocked) but don't inspect stdout, since
+        # /bin/grep may be a path (macOS runners) where stdin piping
+        # through our subprocess harness behaves differently — the
+        # block/no-block decision is what we're testing here, not the
+        # real grep binary.
+        r = self._run_shim(shim, "foo", stdin=b"bar\nfoo\nbaz\n")
+        assert r.returncode != 127, (
+            f"plain grep must not be blocked, got rc={r.returncode} stderr={r.stderr!r}"
+        )
+
+        # Short non-recursive flag — not blocked.
+        r = self._run_shim(shim, "-n", "foo", "/dev/null")
+        assert r.returncode != 127
+
+    def test_yolo_ps_script_generated(self, jail_home, monkeypatch):
+        """``yolo-ps`` is the jail-side CLI for the host-processes
+        loophole.  It's shipped as a wheel console script on the host,
+        but the wheel isn't installed inside the jail — the entrypoint
+        has to drop an equivalent into ``~/.local/bin/`` at boot, same
+        pattern as ``yolo-journalctl`` / ``yolo-cglimit``."""
+        monkeypatch.setenv("YOLO_REPO_ROOT", "/opt/yolo-jail")
+        entrypoint.generate_yolo_ps_script()
+        path = entrypoint.HOME / ".local" / "bin" / "yolo-ps"
+        assert path.is_file()
+        assert path.stat().st_mode & 0o111, "should be executable"
+        content = path.read_text()
+        # Reaches the shipped src.yolo_ps implementation — no logic
+        # duplication from the generator.
+        assert "src.yolo_ps" in content
+        assert "/opt/yolo-jail" in content
+
+    def test_yolo_wrapper_does_not_rely_on_pythonpath_or_cd(
+        self, jail_home, monkeypatch
+    ):
+        """Regression test for two different breakage modes of the shim:
+
+        1. PYTHONPATH-based: ``uv run`` doesn't reliably honor PYTHONPATH,
+           so ``from src.cli import main`` fails with ModuleNotFoundError.
+        2. cd-based: cd'ing into /opt/yolo-jail (a read-only bind mount)
+           before calling ``uv run`` causes ``uv`` to bail with
+           "Current directory does not exist" because its getcwd() can't
+           resolve the bind-mounted CWD.
+
+        The shim must make ``src`` importable without either gambit.
+        Today's approach: a bootstrap Python file in the writable shim
+        dir that does ``sys.path.insert(0, repo_root)`` before importing.
+        """
+        monkeypatch.setenv("YOLO_REPO_ROOT", "/opt/yolo-jail")
+        entrypoint.generate_yolo_wrapper()
+        shim = (entrypoint.SHIM_DIR / "yolo").read_text()
+        # No cd into the repo root — that path is a read-only bind
+        # mount on production jails and breaks uv's getcwd.
+        assert "cd /opt/yolo-jail" not in shim, (
+            "shim must not cd into the read-only repo root"
+        )
+        assert "cd " not in shim.split("exec ")[0], (
+            "shim must not cd anywhere before exec"
+        )
+        # No PYTHONPATH dependency.
+        assert "PYTHONPATH" not in shim, (
+            "shim must not rely on PYTHONPATH (uv run strips it unreliably)"
+        )
+        # Must reach src via a bootstrap script in the writable shim dir.
+        bootstrap_py = entrypoint.SHIM_DIR / "_yolo_bootstrap.py"
+        assert bootstrap_py.is_file(), (
+            "shim should invoke a bootstrap .py in the shim dir"
+        )
+        bootstrap = bootstrap_py.read_text()
+        assert "sys.path.insert" in bootstrap
+        assert "/opt/yolo-jail" in bootstrap
+        assert "from src.cli import main" in bootstrap
+        # Shim should reference the bootstrap by path.
+        assert str(bootstrap_py) in shim
+
     def test_blocked_tool_no_fallthrough(self, jail_home, monkeypatch):
         monkeypatch.setenv(
             "YOLO_BLOCK_CONFIG",
@@ -150,6 +335,9 @@ class TestBashrcGeneration:
         content = entrypoint.BASHRC_PATH.read_text()
         assert "alias gemini='gemini --yolo'" in content
         assert "alias copilot='copilot --yolo --no-auto-update'" in content
+        assert "alias claude='claude --dangerously-skip-permissions'" not in content
+        # Claude YOLO is via settings.json allow rules, not an alias flag
+        assert "permissions.allow" in content or "settings.json" in content
 
     def test_pager_disabled(self, jail_home, monkeypatch):
         monkeypatch.setenv("YOLO_HOST_DIR", "test")
@@ -162,10 +350,150 @@ class TestBashrcGeneration:
         monkeypatch.setenv("YOLO_HOST_DIR", "test")
         entrypoint.generate_bashrc()
         content = entrypoint.BASHRC_PATH.read_text()
-        assert "/mise/shims" in content or "MISE_DATA_DIR" in content
-        assert content.index("$NPM_CONFIG_PREFIX/bin") < content.index(
-            "${MISE_DATA_DIR:-/mise}/shims"
+        mise_shims = str(entrypoint.MISE_SHIMS)
+        assert mise_shims in content
+        assert content.index("$NPM_CONFIG_PREFIX/bin") < content.index(mise_shims)
+
+    def test_local_bin_in_path(self, jail_home, monkeypatch):
+        """~/.local/bin is on PATH for native Claude binary."""
+        monkeypatch.setenv("YOLO_HOST_DIR", "test")
+        entrypoint.generate_bashrc()
+        content = entrypoint.BASHRC_PATH.read_text()
+        assert "$HOME/.local/bin" in content
+        # ~/.local/bin should come before npm-global (native claude takes precedence)
+        assert content.index("$HOME/.local/bin") < content.index(
+            "$NPM_CONFIG_PREFIX/bin"
         )
+
+    def test_exports_ca_bundle_env_vars(self, jail_home, monkeypatch):
+        """bashrc exports SSL_CERT_FILE / REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE /
+        GIT_SSL_CAINFO pointing at $HOME/.yolo-ca-bundle.crt so every
+        standard TLS client trusts loophole CAs, not just Node."""
+        monkeypatch.setenv("YOLO_HOST_DIR", "test")
+        entrypoint.generate_bashrc()
+        content = entrypoint.BASHRC_PATH.read_text()
+        for var in (
+            "SSL_CERT_FILE",
+            "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
+        ):
+            assert f'export {var}="$HOME/.yolo-ca-bundle.crt"' in content, (
+                f"{var} not exported from bashrc"
+            )
+
+
+# -- CA bundle generation --
+
+
+class TestCaBundleGeneration:
+    """generate_ca_bundle() builds a combined PEM bundle under $HOME and
+    points every standard trust-store env var at it."""
+
+    def _snapshot_env(self, monkeypatch):
+        """generate_ca_bundle mutates os.environ; isolate each test."""
+        for v in (
+            "SSL_CERT_FILE",
+            "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
+            "NODE_EXTRA_CA_CERTS",
+        ):
+            monkeypatch.delenv(v, raising=False)
+
+    def test_bundle_includes_baseline(self, jail_home, monkeypatch):
+        """SSL_CERT_FILE (the Nix cacert bundle baked into the image)
+        must be part of the combined bundle — otherwise we'd lose
+        trust in every Mozilla root."""
+        self._snapshot_env(monkeypatch)
+        baseline = jail_home / "baseline.crt"
+        baseline.write_bytes(
+            b"-----BEGIN CERTIFICATE-----\nBASELINE\n-----END CERTIFICATE-----\n"
+        )
+        monkeypatch.setenv("SSL_CERT_FILE", str(baseline))
+
+        bundle = entrypoint.generate_ca_bundle()
+
+        contents = bundle.read_bytes()
+        assert b"BASELINE" in contents
+
+    def test_bundle_includes_loophole_cas(self, jail_home, monkeypatch):
+        """Every path in NODE_EXTRA_CA_CERTS (colon-separated) must
+        appear in the combined bundle — that's the whole point."""
+        self._snapshot_env(monkeypatch)
+        ca1 = jail_home / "broker.crt"
+        ca2 = jail_home / "other-loophole.crt"
+        ca1.write_bytes(
+            b"-----BEGIN CERTIFICATE-----\nBROKERCA\n-----END CERTIFICATE-----\n"
+        )
+        ca2.write_bytes(
+            b"-----BEGIN CERTIFICATE-----\nOTHERCA\n-----END CERTIFICATE-----\n"
+        )
+        monkeypatch.setenv("NODE_EXTRA_CA_CERTS", f"{ca1}{os.pathsep}{ca2}")
+
+        bundle = entrypoint.generate_ca_bundle()
+
+        contents = bundle.read_bytes()
+        assert b"BROKERCA" in contents
+        assert b"OTHERCA" in contents
+
+    def test_bundle_tolerates_missing_sources(self, jail_home, monkeypatch):
+        """Unreadable baseline and dangling loophole CA paths must not
+        crash — an empty combined bundle is still better than a
+        dangling env var pointing at a nonexistent file."""
+        self._snapshot_env(monkeypatch)
+        monkeypatch.setenv("SSL_CERT_FILE", "/nonexistent/baseline.crt")
+        monkeypatch.setenv(
+            "NODE_EXTRA_CA_CERTS", f"/nonexistent/a.crt{os.pathsep}/nonexistent/b.crt"
+        )
+
+        bundle = entrypoint.generate_ca_bundle()
+        assert bundle.exists()
+
+    def test_bundle_sets_standard_env_vars(self, jail_home, monkeypatch):
+        """Every standard trust-store var (SSL_CERT_FILE, REQUESTS_CA_BUNDLE,
+        CURL_CA_BUNDLE, GIT_SSL_CAINFO) is set to the combined bundle
+        path so children of the entrypoint inherit them even before
+        bashrc runs."""
+        self._snapshot_env(monkeypatch)
+        baseline = jail_home / "baseline.crt"
+        baseline.write_bytes(
+            b"-----BEGIN CERTIFICATE-----\nBASELINE\n-----END CERTIFICATE-----\n"
+        )
+        monkeypatch.setenv("SSL_CERT_FILE", str(baseline))
+
+        bundle = entrypoint.generate_ca_bundle()
+
+        bundle_str = str(bundle)
+        assert os.environ["SSL_CERT_FILE"] == bundle_str
+        assert os.environ["REQUESTS_CA_BUNDLE"] == bundle_str
+        assert os.environ["CURL_CA_BUNDLE"] == bundle_str
+        assert os.environ["GIT_SSL_CAINFO"] == bundle_str
+
+    def test_bundle_does_not_recurse_on_its_own_path(self, jail_home, monkeypatch):
+        """On the *second* boot of a jail the baked SSL_CERT_FILE the
+        entrypoint sees in os.environ is the one the previous boot set —
+        i.e. the bundle itself.  We must not read it back into itself
+        (would double its size every boot)."""
+        self._snapshot_env(monkeypatch)
+        bundle_path = jail_home / ".yolo-ca-bundle.crt"
+        bundle_path.write_bytes(
+            b"-----BEGIN CERTIFICATE-----\nPRIOR\n-----END CERTIFICATE-----\n"
+        )
+        # Prior boot's env — SSL_CERT_FILE points at our own bundle.
+        monkeypatch.setenv("SSL_CERT_FILE", str(bundle_path))
+        ca = jail_home / "extra.crt"
+        ca.write_bytes(
+            b"-----BEGIN CERTIFICATE-----\nEXTRA\n-----END CERTIFICATE-----\n"
+        )
+        monkeypatch.setenv("NODE_EXTRA_CA_CERTS", str(ca))
+
+        entrypoint.generate_ca_bundle()
+
+        body = bundle_path.read_bytes()
+        # Prior cruft must not be re-inlined; fresh extras must be in.
+        assert b"PRIOR" not in body
+        assert b"EXTRA" in body
 
 
 # -- Copilot config --
@@ -488,6 +816,201 @@ class TestGeminiConfig:
         assert "mcpServers" in cfg
 
 
+# -- Claude config --
+
+
+class TestClaudeConfig:
+    def test_mcp_servers_in_claude_json(self, jail_home):
+        """MCP servers go in ~/.claude.json (user scope), not settings.json."""
+        entrypoint.configure_claude()
+        claude_json = json.loads((entrypoint.HOME / ".claude.json").read_text())
+        assert "mcpServers" in claude_json
+        # settings.json should NOT have mcpServers
+        settings = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
+        assert "mcpServers" not in settings
+
+    def test_yolo_mode_default(self, jail_home):
+        """settings.json is intentionally minimal — actual YOLO comes
+        from cli.py injecting ``--dangerously-skip-permissions`` into
+        the claude command.  That flag bypasses the permission system
+        entirely, so maintaining a per-tool allow-list here was both
+        redundant and fragile (we kept missing new tools + new MCP
+        servers).  What remains is defensive: ``acceptEdits`` default
+        mode and ``additionalDirectories=["/"]`` so *if* the flag is
+        ever dropped the jail still fails relatively open rather than
+        prompting for everything.
+
+        See handover bug 2026-04-22: bare ``Bash`` in the allow-list
+        was inert (pattern required), so our "yolo" was half-permissioned
+        for weeks.  The flag is the single source of truth now."""
+        entrypoint.configure_claude()
+        cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
+        perms = cfg["permissions"]
+        # Minimal safety net; real YOLO is the CLI flag.
+        assert perms.get("defaultMode") == "acceptEdits"
+        assert perms.get("additionalDirectories") == ["/"]
+        assert cfg["skipDangerousModePermissionPrompt"] is True
+        # No fragile allow-list entries — the flag makes them irrelevant.
+        allow = perms.get("allow") or []
+        assert "Bash" not in allow, "bare-name rules are inert; drop them"
+        assert "Bash(*)" not in allow, (
+            "allow-list per-tool is irrelevant under --dangerously-skip-permissions"
+        )
+        assert "mcp__*" not in allow
+
+    def test_allow_list_is_empty_under_dangerously_skip_permissions(
+        self, jail_home, monkeypatch
+    ):
+        """Per-tool ``mcp__<name>`` / ``Bash(*)`` rules used to live
+        here to work around Claude's pattern matcher.  The flag makes
+        them all irrelevant — nothing checks the allow-list when
+        ``--dangerously-skip-permissions`` is on.  Keep the list empty
+        so a future reader doesn't have to read 20 lines of commentary
+        to understand whether the list matters."""
+        monkeypatch.setenv(
+            "YOLO_MCP_PRESETS",
+            json.dumps(["chrome-devtools", "sequential-thinking"]),
+        )
+        monkeypatch.setenv(
+            "YOLO_MCP_SERVERS",
+            json.dumps({"probe-mcp": {"command": "/workspace/probe-mcp.py"}}),
+        )
+        entrypoint.configure_claude()
+        cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
+        assert cfg["permissions"]["allow"] == []
+
+    def test_workspace_project_auto_approves_mcp(self, jail_home, monkeypatch):
+        """The /workspace project entry has enableAllProjectMcpServers=True.
+
+        Defense in depth against any secondary per-server trust dialog that
+        Claude may fire on first use of an MCP server (separate from the
+        per-tool permission matcher).
+        """
+        monkeypatch.setenv(
+            "YOLO_MCP_PRESETS",
+            json.dumps(["chrome-devtools"]),
+        )
+        entrypoint.configure_claude()
+        claude_json = json.loads((entrypoint.HOME / ".claude.json").read_text())
+        project = claude_json["projects"]["/workspace"]
+        assert project["enableAllProjectMcpServers"] is True
+        assert project["hasTrustDialogAccepted"] is True
+
+    def test_auto_update_disabled(self, jail_home):
+        """settings.json disables auto-updates (startup bootstrap owns updates)."""
+        entrypoint.configure_claude()
+        cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
+        assert cfg["preferences"]["autoUpdaterStatus"] == "disabled"
+
+    def test_lsp_tool_enabled(self, jail_home):
+        """settings.json enables ENABLE_LSP_TOOL for language server support."""
+        entrypoint.configure_claude()
+        cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
+        assert cfg["env"]["ENABLE_LSP_TOOL"] == "1"
+
+    def test_lsp_plugins_enabled(self, jail_home):
+        """Default LSP plugins are enabled in settings.json."""
+        entrypoint.configure_claude()
+        cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
+        plugins = cfg.get("enabledPlugins", {})
+        assert plugins.get("pyright-lsp@claude-plugins-official") is True
+        assert plugins.get("typescript-lsp@claude-plugins-official") is True
+        assert plugins.get("gopls-lsp@claude-plugins-official") is True
+
+    def test_preserves_existing_settings(self, jail_home):
+        """configure_claude merges into existing settings.json."""
+        entrypoint.CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+        existing = {"myCustomKey": True}
+        (entrypoint.CLAUDE_DIR / "settings.json").write_text(json.dumps(existing))
+        entrypoint.configure_claude()
+        cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
+        assert cfg["myCustomKey"] is True
+        assert cfg["permissions"].get("defaultMode") == "acceptEdits"
+
+    def test_preserves_existing_claude_json(self, jail_home):
+        """configure_claude merges MCP into existing ~/.claude.json."""
+        existing = {
+            "hasCompletedOnboarding": True,
+            "mcpServers": {"custom": {"command": "foo"}},
+        }
+        (entrypoint.HOME / ".claude.json").write_text(json.dumps(existing))
+        entrypoint.configure_claude()
+        claude_json = json.loads((entrypoint.HOME / ".claude.json").read_text())
+        assert claude_json["hasCompletedOnboarding"] is True
+        assert "custom" in claude_json["mcpServers"]
+
+    def test_handles_corrupt_json(self, jail_home):
+        entrypoint.CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+        (entrypoint.CLAUDE_DIR / "settings.json").write_text("not json{{{")
+        entrypoint.configure_claude()  # should not raise
+        cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
+        assert cfg["permissions"].get("defaultMode") == "acceptEdits"
+
+    def test_migrates_bypass_permissions(self, jail_home):
+        """Existing bypassPermissions is replaced with acceptEdits."""
+        entrypoint.CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+        existing = {"permissions": {"defaultMode": "bypassPermissions"}}
+        (entrypoint.CLAUDE_DIR / "settings.json").write_text(json.dumps(existing))
+        entrypoint.configure_claude()
+        cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
+        assert cfg["permissions"]["defaultMode"] == "acceptEdits"
+        assert cfg["permissions"].get("defaultMode") == "acceptEdits"
+        assert cfg["skipDangerousModePermissionPrompt"] is True
+
+    def test_removes_stale_mcp_from_settings(self, jail_home):
+        """Old mcpServers in settings.json are cleaned up."""
+        entrypoint.CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+        existing = {"mcpServers": {"stale-server": {"command": "old"}}}
+        (entrypoint.CLAUDE_DIR / "settings.json").write_text(json.dumps(existing))
+        entrypoint.configure_claude()
+        cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
+        assert "mcpServers" not in cfg
+
+    def test_credentials_symlink_created(self, jail_home):
+        """configure_claude creates a symlink from .claude/.credentials.json
+        to the shared credentials dir so Claude's atomic writer works."""
+        entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+        (entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR / ".credentials.json").touch()
+        entrypoint.configure_claude()
+        link = entrypoint.CLAUDE_DIR / ".credentials.json"
+        assert link.is_symlink()
+        assert (
+            os.readlink(str(link)) == "../.claude-shared-credentials/.credentials.json"
+        )
+
+    def test_credentials_symlink_migrates_existing_file(self, jail_home):
+        """If .credentials.json is a regular file (old setup), its data is
+        migrated to the shared dir and replaced with a symlink."""
+        entrypoint.CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+        entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+        # Old-style regular file with valid credentials
+        cred_data = (
+            '{"claudeAiOauth": {"accessToken": "test", "expiresAt": 9999999999}}'
+        )
+        (entrypoint.CLAUDE_DIR / ".credentials.json").write_text(cred_data)
+        (entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR / ".credentials.json").touch()
+
+        entrypoint.configure_claude()
+
+        link = entrypoint.CLAUDE_DIR / ".credentials.json"
+        assert link.is_symlink()
+        # Data should have been migrated to shared dir
+        shared = entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR / ".credentials.json"
+        assert "test" in shared.read_text()
+
+    def test_credentials_symlink_idempotent(self, jail_home):
+        """Running configure_claude twice doesn't break the symlink."""
+        entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+        (entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR / ".credentials.json").touch()
+        entrypoint.configure_claude()
+        entrypoint.configure_claude()
+        link = entrypoint.CLAUDE_DIR / ".credentials.json"
+        assert link.is_symlink()
+        assert (
+            os.readlink(str(link)) == "../.claude-shared-credentials/.credentials.json"
+        )
+
+
 # -- MCP wrappers --
 
 
@@ -536,8 +1059,22 @@ class TestMiseConfig:
         assert 'python = "3.12"' in content
         # Missing base tools added
         assert 'go = "latest"' in content
-        assert 'gemini = "latest"' in content
-        assert '"npm:@github/copilot" = "latest"' in content
+        # copilot and gemini are NOT in mise base_tools (managed by bootstrap npm install)
+        assert '"npm:@github/copilot"' not in content
+        assert "gemini" not in content
+
+    def test_removes_retired_tools(self, jail_home):
+        """Retired tools (copilot/gemini) are removed from existing mise configs."""
+        entrypoint.MISE_CONFIG_DIR.mkdir(parents=True)
+        (entrypoint.MISE_CONFIG_DIR / "config.toml").write_text(
+            '[tools]\nnode = "22"\ngemini = "latest"\n"npm:@github/copilot" = "latest"\n'
+        )
+        entrypoint.generate_mise_config()
+        content = (entrypoint.MISE_CONFIG_DIR / "config.toml").read_text()
+        assert 'node = "22"' in content
+        # Retired tools should be removed
+        assert "gemini" not in content
+        assert "npm:@github/copilot" not in content
 
 
 # -- Bootstrap script --
@@ -550,63 +1087,61 @@ class TestBootstrapScript:
         assert "chrome-devtools-mcp" in script
         assert "mcp-language-server" in script
         assert "showboat" in script
-        assert (
-            "npm install -g @google/gemini-cli@latest @github/copilot@latest" in script
-        )
+        # Agent CLIs (gemini, copilot, claude) are NOT updated in bootstrap —
+        # lazy-update launchers in ~/.yolo-shims/ handle that on first use.
+        assert "@google/gemini-cli@latest" not in script
+        assert "@github/copilot@latest" not in script
+        assert "@anthropic-ai/claude-code" not in script
+        assert "https://claude.ai/install.sh" not in script
         assert os.access(jail_home / ".yolo-bootstrap.sh", os.X_OK)
 
 
-# -- Skills merging --
+# -- Agent launchers --
 
 
-class TestSkillsMerging:
-    def test_host_skills_copied(self, jail_home, monkeypatch, tmp_path):
-        host_skills = tmp_path / "host-skills"
-        (host_skills / "my-skill").mkdir(parents=True)
-        (host_skills / "my-skill" / "SKILL.md").write_text("# My Skill")
-        monkeypatch.setenv("YOLO_HOST_GEMINI_SKILLS", str(host_skills))
-        entrypoint.merge_skills()
-        assert (entrypoint.COPILOT_DIR / "skills" / "my-skill" / "SKILL.md").exists()
+class TestAgentLaunchers:
+    def test_creates_launchers(self, jail_home):
+        entrypoint.SHIM_DIR.mkdir(parents=True, exist_ok=True)
+        entrypoint.generate_agent_launchers()
+        for name in ("gemini", "copilot", "claude"):
+            launcher = entrypoint.SHIM_DIR / name
+            assert launcher.exists(), f"{name} launcher not created"
+            assert os.access(launcher, os.X_OK), f"{name} launcher not executable"
+            content = launcher.read_text()
+            assert "YOLO_BYPASS_SHIMS=1" in content
+            assert "exec " in content
 
-    def test_workspace_skills_override(self, jail_home, monkeypatch, tmp_path):
-        # Host skill
-        host_skills = tmp_path / "host-skills"
-        (host_skills / "shared").mkdir(parents=True)
-        (host_skills / "shared" / "SKILL.md").write_text("host version")
-        monkeypatch.setenv("YOLO_HOST_GEMINI_SKILLS", str(host_skills))
+    def test_does_not_overwrite_blocked_shim(self, jail_home, monkeypatch):
+        """If a tool is blocked via YOLO_BLOCK_CONFIG, the launcher must not overwrite it."""
+        monkeypatch.setenv(
+            "YOLO_BLOCK_CONFIG",
+            '[{"name": "gemini", "message": "blocked"}]',
+        )
+        entrypoint.generate_shims()
+        blocked_content = (entrypoint.SHIM_DIR / "gemini").read_text()
+        entrypoint.generate_agent_launchers()
+        assert (entrypoint.SHIM_DIR / "gemini").read_text() == blocked_content
+        # copilot and claude should still get launchers
+        assert (entrypoint.SHIM_DIR / "copilot").exists()
+        assert (entrypoint.SHIM_DIR / "claude").exists()
 
-        # Workspace skill with same name
-        # Can't create in /workspace for real, so test the logic via a temp workspace
-        ws = tmp_path / "ws-skills"
-        (ws / "shared").mkdir(parents=True)
-        (ws / "shared" / "SKILL.md").write_text("workspace version")
+    def test_npm_launcher_checks_version(self, jail_home):
+        entrypoint.SHIM_DIR.mkdir(parents=True, exist_ok=True)
+        entrypoint.generate_agent_launchers()
+        content = (entrypoint.SHIM_DIR / "gemini").read_text()
+        assert "npm view" in content  # registry version check
+        assert "package.json" in content  # local version check
+        assert "UPDATE_INTERVAL" in content  # stamp-based throttling
 
-        entrypoint.merge_skills()
-        # At this point host skills are copied. Now manually call _copy_skill_dirs
-        # to simulate workspace override
-        entrypoint._copy_skill_dirs(ws, entrypoint.COPILOT_DIR / "skills")
-        content = (
-            entrypoint.COPILOT_DIR / "skills" / "shared" / "SKILL.md"
-        ).read_text()
-        assert content == "workspace version"
+    def test_claude_launcher_uses_native_installer(self, jail_home):
+        entrypoint.SHIM_DIR.mkdir(parents=True, exist_ok=True)
+        entrypoint.generate_agent_launchers()
+        content = (entrypoint.SHIM_DIR / "claude").read_text()
+        assert "claude.ai/install.sh" in content
+        assert '"$REAL_BIN" install' in content  # native update command
 
-    def test_skills_cleaned_between_runs(self, jail_home, monkeypatch, tmp_path):
-        host_skills = tmp_path / "host-skills"
-        (host_skills / "old-skill").mkdir(parents=True)
-        (host_skills / "old-skill" / "SKILL.md").write_text("old")
-        monkeypatch.setenv("YOLO_HOST_GEMINI_SKILLS", str(host_skills))
-        entrypoint.merge_skills()
-        assert (entrypoint.COPILOT_DIR / "skills" / "old-skill").exists()
 
-        # Now remove from host and re-merge
-        import shutil
-
-        shutil.rmtree(host_skills / "old-skill")
-        (host_skills / "new-skill").mkdir(parents=True)
-        (host_skills / "new-skill" / "SKILL.md").write_text("new")
-        entrypoint.merge_skills()
-        assert not (entrypoint.COPILOT_DIR / "skills" / "old-skill").exists()
-        assert (entrypoint.COPILOT_DIR / "skills" / "new-skill").exists()
+# Skills merging moved to cli.py (_prepare_skills) — see test_cli_unit.py
 
 
 # -- Container-side port forwarding --
@@ -1011,6 +1546,18 @@ class TestMiseConfigUpdate:
         content = config_path.read_text()
         assert 'node = "23"' in content
 
+    def test_system_version_replaced_with_base(self, jail_home, monkeypatch):
+        monkeypatch.delenv("YOLO_MISE_TOOLS", raising=False)
+        entrypoint.generate_mise_config()
+        config_path = jail_home / ".config" / "mise" / "config.toml"
+        # Simulate stale "system" value (deprecated by mise)
+        content = config_path.read_text().replace('node = "22"', 'node = "system"')
+        config_path.write_text(content)
+        entrypoint.generate_mise_config()
+        content = config_path.read_text()
+        assert 'node = "22"' in content
+        assert '"system"' not in content
+
     def test_base_tools_not_duplicated(self, jail_home, monkeypatch):
         monkeypatch.delenv("YOLO_MISE_TOOLS", raising=False)
         entrypoint.generate_mise_config()
@@ -1019,6 +1566,28 @@ class TestMiseConfigUpdate:
         content = config_path.read_text()
         # node should appear exactly once
         assert content.count("node =") == 1
+
+    def test_injected_tool_matching_base_not_duplicated(self, jail_home, monkeypatch):
+        # Workspace injecting a tool that also appears in base_tools (e.g.,
+        # python = "3.13") previously produced a config with two `python =`
+        # lines, which mise refuses to parse.
+        monkeypatch.setenv("YOLO_MISE_TOOLS", json.dumps({"python": "3.13"}))
+        entrypoint.generate_mise_config()
+        config_path = jail_home / ".config" / "mise" / "config.toml"
+        content = config_path.read_text()
+        assert content.count("python =") == 1
+
+    def test_existing_duplicate_is_self_healed(self, jail_home, monkeypatch):
+        # Older writes may have left a duplicate tool line on disk. The next
+        # run should repair it rather than leave the file unparseable.
+        monkeypatch.delenv("YOLO_MISE_TOOLS", raising=False)
+        entrypoint.generate_mise_config()
+        config_path = jail_home / ".config" / "mise" / "config.toml"
+        content = config_path.read_text()
+        config_path.write_text(content.rstrip("\n") + '\npython = "3.13"\n')
+        assert config_path.read_text().count("python =") == 2
+        entrypoint.generate_mise_config()
+        assert config_path.read_text().count("python =") == 1
 
 
 class TestExecBash:
@@ -1033,6 +1602,15 @@ class TestExecBash:
         assert args[0] == "bash"
         assert "-c" in args[1]
         assert "echo hello" in args[1][-1]
+
+    @patch("os.execvp")
+    def test_exec_bash_includes_local_bin(self, mock_exec, jail_home, monkeypatch):
+        monkeypatch.setenv("PATH", "/bin:/usr/bin")
+        entrypoint.exec_bash("echo test")
+        mock_exec.assert_called_once()
+        # Verify .local/bin is on PATH (for yolo-cglimit)
+        env_path = os.environ["PATH"]
+        assert ".local/bin" in env_path
 
     @patch("os.execvp")
     def test_exec_bash_default_interactive(self, mock_exec, jail_home, monkeypatch):
@@ -1050,14 +1628,87 @@ class TestExecBash:
         mock_exec.assert_called_once()
 
 
+class TestCglimitScript:
+    """Test yolo-cglimit helper script generation."""
+
+    def test_cglimit_script_created(self, jail_home):
+        entrypoint.generate_cglimit_script()
+        script = jail_home / ".local" / "bin" / "yolo-cglimit"
+        assert script.exists()
+        assert script.stat().st_mode & stat.S_IEXEC
+
+    def test_cglimit_script_content(self, jail_home):
+        entrypoint.generate_cglimit_script()
+        script = jail_home / ".local" / "bin" / "yolo-cglimit"
+        content = script.read_text()
+        # Python script that talks to the host-side cgroup daemon via socket.
+        # The socket path moved with the loopholes refactor — it now lives
+        # under the unified /run/yolo-services/ dir as cgroup-delegate.sock.
+        assert "#!/usr/bin/env python3" in content
+        assert "/run/yolo-services/cgroup-delegate.sock" in content
+        assert "create_and_join" in content
+        assert "--cpu" in content
+        assert "--memory" in content
+        assert "--pids" in content
+        assert "SO_PEERCRED" in content
+        assert "os.execvp" in content
+        assert "--name" in content
+
+    def test_cglimit_script_idempotent(self, jail_home):
+        entrypoint.generate_cglimit_script()
+        entrypoint.generate_cglimit_script()  # Second call should not fail
+        script = jail_home / ".local" / "bin" / "yolo-cglimit"
+        assert script.exists()
+
+    def test_cglimit_cpu_formula(self, jail_home):
+        """Verify the cglimit script sends cpu_pct to the host daemon."""
+        entrypoint.generate_cglimit_script()
+        content = (jail_home / ".local" / "bin" / "yolo-cglimit").read_text()
+        # The script sends cpu_pct to the host daemon, which computes the quota
+        assert "cpu_pct" in content
+        assert "send_request" in content
+
+
+class TestCgroupDelegation:
+    """Test cgroup v2 delegation setup (host-side daemon model)."""
+
+    def test_reports_available_when_socket_exists(self, jail_home, tmp_path, capsys):
+        """Should report 'available' when the daemon socket exists."""
+        sock = tmp_path / "cgroup.sock"
+        sock.touch()
+        import entrypoint as ep
+
+        original = ep.CGD_SOCKET
+        ep.CGD_SOCKET = sock
+        try:
+            ep.setup_cgroup_delegation()
+            captured = capsys.readouterr()
+            assert "available" in captured.err
+        finally:
+            ep.CGD_SOCKET = original
+
+    def test_reports_unavailable_when_no_socket(self, jail_home, tmp_path, capsys):
+        """Should report 'not available' when daemon socket doesn't exist."""
+        import entrypoint as ep
+
+        original = ep.CGD_SOCKET
+        ep.CGD_SOCKET = tmp_path / "no-such-socket"
+        try:
+            ep.setup_cgroup_delegation()
+            captured = capsys.readouterr()
+            assert "not available" in captured.err
+        finally:
+            ep.CGD_SOCKET = original
+
+
 class TestMainFunction:
     """Cover main() orchestration (lines 951-1003)."""
 
     @patch("entrypoint.exec_bash")
     @patch("entrypoint.start_container_port_forwarding")
+    @patch("entrypoint.configure_claude")
     @patch("entrypoint.configure_gemini")
     @patch("entrypoint.configure_copilot")
-    @patch("entrypoint.merge_skills")
     @patch("entrypoint.configure_jj")
     @patch("entrypoint.configure_git")
     @patch("entrypoint.generate_mcp_wrappers")
@@ -1066,12 +1717,16 @@ class TestMainFunction:
     @patch("entrypoint.generate_bootstrap_script")
     @patch("entrypoint.generate_bashrc")
     @patch("entrypoint.generate_shims")
+    @patch("entrypoint.setup_cgroup_delegation")
+    @patch("entrypoint.generate_cglimit_script")
     @patch("entrypoint._perf_dump")
     @patch("entrypoint._perf")
     def test_main_calls_all_generators(
         self,
         mock_perf,
         mock_dump,
+        mock_cglimit,
+        mock_cgroup,
         mock_shims,
         mock_bashrc,
         mock_bootstrap,
@@ -1080,9 +1735,9 @@ class TestMainFunction:
         mock_wrappers,
         mock_git,
         mock_jj,
-        mock_skills,
         mock_copilot,
         mock_gemini,
+        mock_claude,
         mock_port_fwd,
         mock_exec,
         jail_home,
@@ -1101,13 +1756,16 @@ class TestMainFunction:
         mock_jj.assert_called_once()
         mock_copilot.assert_called_once()
         mock_gemini.assert_called_once()
+        mock_claude.assert_called_once()
+        mock_cgroup.assert_called_once()
+        mock_cglimit.assert_called_once()
         mock_exec.assert_called_once_with("echo hello")
 
     @patch("entrypoint.exec_bash")
     @patch("entrypoint.start_container_port_forwarding")
+    @patch("entrypoint.configure_claude")
     @patch("entrypoint.configure_gemini")
     @patch("entrypoint.configure_copilot")
-    @patch("entrypoint.merge_skills")
     @patch("entrypoint.configure_jj")
     @patch("entrypoint.configure_git")
     @patch("entrypoint.generate_mcp_wrappers")
@@ -1116,12 +1774,16 @@ class TestMainFunction:
     @patch("entrypoint.generate_bootstrap_script")
     @patch("entrypoint.generate_bashrc")
     @patch("entrypoint.generate_shims")
+    @patch("entrypoint.setup_cgroup_delegation")
+    @patch("entrypoint.generate_cglimit_script")
     @patch("entrypoint._perf_dump")
     @patch("entrypoint._perf")
     def test_main_creates_mise_symlink(
         self,
         mock_perf,
         mock_dump,
+        mock_cglimit,
+        mock_cgroup,
         mock_shims,
         mock_bashrc,
         mock_bootstrap,
@@ -1130,9 +1792,9 @@ class TestMainFunction:
         mock_wrappers,
         mock_git,
         mock_jj,
-        mock_skills,
         mock_copilot,
         mock_gemini,
+        mock_claude,
         mock_port_fwd,
         mock_exec,
         jail_home,
@@ -1147,9 +1809,9 @@ class TestMainFunction:
 
     @patch("entrypoint.exec_bash")
     @patch("entrypoint.start_container_port_forwarding")
+    @patch("entrypoint.configure_claude")
     @patch("entrypoint.configure_gemini")
     @patch("entrypoint.configure_copilot")
-    @patch("entrypoint.merge_skills")
     @patch("entrypoint.configure_jj")
     @patch("entrypoint.configure_git")
     @patch("entrypoint.generate_mcp_wrappers")
@@ -1158,12 +1820,16 @@ class TestMainFunction:
     @patch("entrypoint.generate_bootstrap_script")
     @patch("entrypoint.generate_bashrc")
     @patch("entrypoint.generate_shims")
+    @patch("entrypoint.setup_cgroup_delegation")
+    @patch("entrypoint.generate_cglimit_script")
     @patch("entrypoint._perf_dump")
     @patch("entrypoint._perf")
     def test_main_trusts_mise_toml(
         self,
         mock_perf,
         mock_dump,
+        mock_cglimit,
+        mock_cgroup,
         mock_shims,
         mock_bashrc,
         mock_bootstrap,
@@ -1172,9 +1838,9 @@ class TestMainFunction:
         mock_wrappers,
         mock_git,
         mock_jj,
-        mock_skills,
         mock_copilot,
         mock_gemini,
+        mock_claude,
         mock_port_fwd,
         mock_exec,
         jail_home,
@@ -1189,3 +1855,110 @@ class TestMainFunction:
         with patch("subprocess.run"):
             entrypoint.main()
         mock_exec.assert_called_once()
+
+
+# -- jail_daemon_supervisor single-instance gate --
+
+
+class TestSupervisorSingleInstance:
+    """``start_jail_daemon_supervisor`` must be idempotent across repeated
+    entrypoint invocations.  Root cause of duplicated supervisors (see
+    handover follow-up #3): entrypoint.main() runs on every ``podman
+    exec yolo-entrypoint <cmd>``, calling us; each extra supervisor
+    forks a fresh oauth_broker_jail that tries to bind :443 and
+    crashloops with EADDRINUSE.  Guard with a PID file + liveness
+    probe so re-entrant exec calls observe the existing supervisor and
+    no-op."""
+
+    def _set_daemons_env(self, monkeypatch):
+        """Supervisor is only spawned when YOLO_JAIL_DAEMONS is non-empty."""
+        monkeypatch.setenv(
+            "YOLO_JAIL_DAEMONS",
+            '[{"name":"x","cmd":["/bin/true"],"restart":"no"}]',
+        )
+
+    def test_first_call_spawns_supervisor(self, jail_home, monkeypatch, tmp_path):
+        self._set_daemons_env(monkeypatch)
+        monkeypatch.setattr(entrypoint, "SUPERVISOR_PID_FILE", tmp_path / "sup.pid")
+
+        popen_called = {"n": 0}
+
+        class FakePopen:
+            def __init__(self, *a, **kw):
+                popen_called["n"] += 1
+                self.pid = 99999  # unlikely PID; kill(pid,0) will raise
+
+        monkeypatch.setattr(entrypoint.subprocess, "Popen", FakePopen)
+        entrypoint.start_jail_daemon_supervisor()
+        assert popen_called["n"] == 1
+        assert (tmp_path / "sup.pid").read_text().strip() == "99999"
+
+    def test_second_call_when_pidfile_points_at_live_process_skips(
+        self, jail_home, monkeypatch, tmp_path
+    ):
+        """If the PID file points at a live process, do nothing — this is
+        the re-entrant exec case that caused the duplication in the
+        first place."""
+        self._set_daemons_env(monkeypatch)
+        # os.getpid() is guaranteed-live — use it as "the running supervisor".
+        pid_file = tmp_path / "sup.pid"
+        pid_file.write_text(str(os.getpid()))
+        monkeypatch.setattr(entrypoint, "SUPERVISOR_PID_FILE", pid_file)
+
+        popen_called = {"n": 0}
+
+        class FakePopen:
+            def __init__(self, *a, **kw):
+                popen_called["n"] += 1
+                self.pid = 99999
+
+        monkeypatch.setattr(entrypoint.subprocess, "Popen", FakePopen)
+        entrypoint.start_jail_daemon_supervisor()
+        assert popen_called["n"] == 0
+
+    def test_stale_pidfile_triggers_respawn(self, jail_home, monkeypatch, tmp_path):
+        """A PID file left by a crashed / killed supervisor must not
+        pin us out of respawning.  Dead PIDs are detected via
+        ``os.kill(pid, 0)`` raising ProcessLookupError."""
+        self._set_daemons_env(monkeypatch)
+        pid_file = tmp_path / "sup.pid"
+        # PID 999999 is very unlikely to exist; test would be flaky if
+        # it did, so fake the liveness probe to be deterministic.
+        pid_file.write_text("999999")
+        monkeypatch.setattr(entrypoint, "SUPERVISOR_PID_FILE", pid_file)
+
+        def fake_kill(pid, sig):
+            raise ProcessLookupError("no such pid")
+
+        monkeypatch.setattr(entrypoint.os, "kill", fake_kill)
+
+        popen_called = {"n": 0}
+
+        class FakePopen:
+            def __init__(self, *a, **kw):
+                popen_called["n"] += 1
+                self.pid = 12345
+
+        monkeypatch.setattr(entrypoint.subprocess, "Popen", FakePopen)
+        entrypoint.start_jail_daemon_supervisor()
+        assert popen_called["n"] == 1
+        # PID file now points at the new supervisor.
+        assert pid_file.read_text().strip() == "12345"
+
+    def test_empty_jail_daemons_is_noop(self, jail_home, monkeypatch, tmp_path):
+        """YOLO_JAIL_DAEMONS empty/unset → still a no-op, unchanged from
+        the pre-guard behavior.  Guard must not add work for loopholes
+        with nothing to supervise."""
+        monkeypatch.delenv("YOLO_JAIL_DAEMONS", raising=False)
+        monkeypatch.setattr(entrypoint, "SUPERVISOR_PID_FILE", tmp_path / "sup.pid")
+
+        popen_called = {"n": 0}
+
+        class FakePopen:
+            def __init__(self, *a, **kw):
+                popen_called["n"] += 1
+
+        monkeypatch.setattr(entrypoint.subprocess, "Popen", FakePopen)
+        entrypoint.start_jail_daemon_supervisor()
+        assert popen_called["n"] == 0
+        assert not (tmp_path / "sup.pid").exists()

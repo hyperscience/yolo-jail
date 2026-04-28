@@ -107,6 +107,37 @@ def test_validate_config_requires_file_extensions_for_lsp_servers():
     assert "config.lsp_servers.python.fileExtensions: expected an object" in errors
 
 
+def test_validate_config_accepts_valid_env():
+    errors, warnings = _validate_config(
+        {"env": {"DATABASE_URL": "postgres://localhost/dev", "DEBUG": "1"}},
+        workspace=Path.cwd(),
+    )
+    assert errors == []
+    assert warnings == []
+
+
+def test_validate_config_rejects_non_dict_env():
+    errors, _ = _validate_config({"env": ["FOO=bar"]}, workspace=Path.cwd())
+    assert "config.env: expected an object of key-value string pairs" in errors
+
+
+def test_validate_config_rejects_non_string_env_value():
+    errors, _ = _validate_config({"env": {"DEBUG": 1}}, workspace=Path.cwd())
+    assert "config.env.DEBUG: expected a string value" in errors
+
+
+def test_validate_config_rejects_invalid_env_var_name():
+    errors, _ = _validate_config({"env": {"123BAD": "val"}}, workspace=Path.cwd())
+    assert any("invalid variable name" in e for e in errors)
+
+
+def test_merge_config_env_workspace_overrides_user():
+    user = {"env": {"A": "1", "B": "2"}}
+    workspace = {"env": {"B": "override", "C": "3"}}
+    merged = merge_config(user, workspace)
+    assert merged["env"] == {"A": "1", "B": "override", "C": "3"}
+
+
 def test_same_file_preset_null_conflict_is_reported():
     conflicts = cli._check_preset_null_conflicts(
         {
@@ -135,33 +166,25 @@ def test_cross_hierarchy_preset_null_override_is_allowed():
     ) == ["sequential-thinking"]
 
 
-def test_init_per_workspace_mcp_configs_seeds_gemini_settings(tmp_path, monkeypatch):
-    shared_home = tmp_path / "shared-home"
-    (shared_home / ".gemini").mkdir(parents=True)
-    (shared_home / ".gemini" / "settings.json").write_text(
-        json.dumps(
-            {
-                "security": {"approvalMode": "yolo"},
-                "general": {"previewFeatures": True},
-                "mcpServers": {"chrome-devtools": {"command": "/bin/node"}},
-            }
-        )
-        + "\n"
-    )
-    monkeypatch.setattr(cli, "GLOBAL_HOME", shared_home)
+def test_seed_agent_dir_copies_auth_files(tmp_path):
+    """_seed_agent_dir copies files from GLOBAL_HOME agent dir into per-workspace overlay."""
+    src = tmp_path / "shared-home" / ".gemini"
+    src.mkdir(parents=True)
+    (src / "hosts.json").write_text('{"auth": true}')
+    (src / "settings.json").write_text('{"theme": "dark"}')
 
-    ws_state = tmp_path / "workspace" / ".yolo" / "home"
-    ws_state.mkdir(parents=True)
+    dst = tmp_path / "workspace" / ".yolo" / "home" / "gemini"
+    dst.mkdir(parents=True)
 
-    cli._init_per_workspace_mcp_configs(ws_state)
+    cli._seed_agent_dir(src, dst)
 
-    assert json.loads((ws_state / "copilot-mcp-config.json").read_text()) == {}
-    assert json.loads((ws_state / "copilot-lsp-config.json").read_text()) == {}
-    assert json.loads((ws_state / "gemini-managed-mcp.json").read_text()) == []
-    seeded = json.loads((ws_state / "gemini-settings.json").read_text())
-    assert seeded["security"]["approvalMode"] == "yolo"
-    assert seeded["general"]["previewFeatures"] is True
-    assert "mcpServers" not in seeded
+    assert (dst / "hosts.json").read_text() == '{"auth": true}'
+    assert (dst / "settings.json").read_text() == '{"theme": "dark"}'
+
+    # Second call should not overwrite
+    (dst / "hosts.json").write_text("modified")
+    cli._seed_agent_dir(src, dst)
+    assert (dst / "hosts.json").read_text() == "modified"
 
 
 class TestConfigSnapshot:
