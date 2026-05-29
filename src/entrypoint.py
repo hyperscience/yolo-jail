@@ -1307,12 +1307,30 @@ def configure_aws_credentials():
     config_path = aws_dir / "config"
 
     helper_path = "yolo-aws-creds"  # found via PATH inside the jail
+
+    # Pull AWS_PROFILE / AWS_REGION from the resolved settings.json env
+    # block — that's where the host's deep-merged Bedrock config lands,
+    # and it's the value Claude Code's SDK will actually read at run
+    # time.  Process env at this point in the entrypoint hasn't yet had
+    # those applied (Claude Code expands its env block only when it
+    # launches), so reading os.environ alone misses them.
+    settings_env: Dict[str, Any] = {}
+    settings_path = CLAUDE_DIR / "settings.json"
+    if settings_path.is_file():
+        try:
+            settings_data = json.loads(settings_path.read_text())
+            settings_env = settings_data.get("env") or {}
+        except (json.JSONDecodeError, OSError):
+            settings_env = {}
+
     region = (
         os.environ.get("YOLO_AWS_REGION")
+        or settings_env.get("AWS_REGION")
         or os.environ.get("AWS_REGION")
         or os.environ.get("AWS_DEFAULT_REGION")
         or ""
     )
+    explicit_profile = settings_env.get("AWS_PROFILE") or os.environ.get("AWS_PROFILE")
 
     def _block(header: str) -> str:
         lines = [header, f"credential_process = {helper_path}"]
@@ -1321,20 +1339,6 @@ def configure_aws_credentials():
         return "\n".join(lines) + "\n"
 
     blocks = [_block("[default]")]
-
-    # Mirror the credential_process under any AWS_PROFILE the jail will
-    # be launched with.  Read the resolved settings.json (configure_claude
-    # already wrote it earlier in main()) so we use the same value the
-    # SDK will see, not just whatever happens to be in os.environ now.
-    explicit_profile: Optional[str] = None
-    settings_path = CLAUDE_DIR / "settings.json"
-    if settings_path.is_file():
-        try:
-            settings = json.loads(settings_path.read_text())
-            explicit_profile = (settings.get("env") or {}).get("AWS_PROFILE")
-        except (json.JSONDecodeError, OSError):
-            pass
-    explicit_profile = explicit_profile or os.environ.get("AWS_PROFILE")
     if explicit_profile and explicit_profile != "default":
         blocks.append(_block(f"[profile {explicit_profile}]"))
 

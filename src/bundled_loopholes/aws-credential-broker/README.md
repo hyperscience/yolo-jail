@@ -35,10 +35,13 @@ Resolution order (highest priority first):
 2. Host's `~/.claude/settings.json` env block (`AWS_PROFILE`, `AWS_REGION`).
 3. Broker process environment (e.g. `AWS_PROFILE` set in the shell that
    spawned `yolo`).
-4. AWS SDK default chain.
+4. For region only: the resolved profile's `region =` line in
+   `~/.aws/config`, read via `aws configure get region --profile <name>`.
+   Mirrors what `aws sts get-session-token` itself uses, so a profile
+   that works on the host CLI works in the broker without extra config.
 
-This means a default-shell `AWS_PROFILE` that's incompatible with
-Bedrock (a common SSO-only profile, for instance) won't override the
+A default-shell `AWS_PROFILE` that's incompatible with Bedrock (a
+common SSO-only profile, for instance) won't override the
 Bedrock-specific profile pinned in `settings.json` — matching what
 Claude Code itself does on the host.
 

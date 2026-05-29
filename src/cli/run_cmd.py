@@ -1751,6 +1751,30 @@ def run(
             )
         run_cmd[image_idx:image_idx] = inserts
 
+    # When aws-credential-broker is active, resolve the AWS region on
+    # the host (same precedence the daemon uses internally — including
+    # ``aws configure get region``) and pass it to the jail as
+    # ``YOLO_AWS_REGION``.  The jail's entrypoint can't replicate the
+    # resolution — there's no aws CLI and no ~/.aws/config inside.
+    # Without this, a host-only setup with region pinned in
+    # ~/.aws/config but absent from ~/.claude/settings.json would
+    # leave Claude Code's Bedrock client unable to find a region.
+    if any(svc.name == "aws-credential-broker" for svc in host_services):
+        try:
+            from src.aws_credential_broker import (
+                _load_config as _aws_load_config,
+                _resolve_region as _aws_resolve_region,
+            )
+            resolved_region = _aws_resolve_region(_aws_load_config())
+        except Exception:
+            resolved_region = None
+        if resolved_region:
+            image_idx = run_cmd.index(_jail_image(runtime))
+            run_cmd[image_idx:image_idx] = [
+                "-e",
+                f"YOLO_AWS_REGION={resolved_region}",
+            ]
+
     run_cmd.append(final_internal_cmd)
 
     if os.environ.get("YOLO_DEBUG"):

@@ -240,6 +240,65 @@ def test_resolve_region_uses_claude_settings(tmp_state, monkeypatch):
     assert ab._resolve_region({}) == "us-west-2"
 
 
+def test_resolve_region_falls_back_to_aws_configure_get(tmp_state, monkeypatch):
+    """When all higher-priority sources are empty, the broker shells out
+    to ``aws configure get region --profile <name>`` and uses what the
+    AWS CLI resolves from ~/.aws/config.  Mirrors what ``aws sts``
+    itself uses internally, so the broker matches host CLI behavior."""
+    from unittest.mock import MagicMock
+
+    tmp, _, _ = tmp_state
+    monkeypatch.setattr(ab, "HOST_CLAUDE_SETTINGS", tmp / "absent.json")
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.setenv("AWS_PROFILE", "bedrock")
+
+    captured: list = []
+
+    def _fake_run(argv, **kw):
+        captured.append(argv)
+        if argv[:4] == ["aws", "configure", "get", "region"]:
+            return MagicMock(returncode=0, stdout="us-east-1\n")
+        raise AssertionError(f"unexpected: {argv}")
+
+    monkeypatch.setattr(ab.subprocess, "run", _fake_run)
+    assert ab._resolve_region({}) == "us-east-1"
+    # And the CLI was invoked with the resolved profile.
+    assert any("--profile" in a and "bedrock" in a for a in captured)
+
+
+def test_resolve_region_returns_none_when_aws_cli_returns_empty(tmp_state, monkeypatch):
+    from unittest.mock import MagicMock
+
+    tmp, _, _ = tmp_state
+    monkeypatch.setattr(ab, "HOST_CLAUDE_SETTINGS", tmp / "absent.json")
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+
+    monkeypatch.setattr(
+        ab.subprocess,
+        "run",
+        lambda *a, **kw: MagicMock(returncode=0, stdout=""),
+    )
+    assert ab._resolve_region({}) is None
+
+
+def test_resolve_region_handles_missing_aws_cli(tmp_state, monkeypatch):
+    """No aws CLI on PATH → fallback returns None gracefully (no crash)."""
+    tmp, _, _ = tmp_state
+    monkeypatch.setattr(ab, "HOST_CLAUDE_SETTINGS", tmp / "absent.json")
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+
+    def _missing(*a, **kw):
+        raise FileNotFoundError("aws not found")
+
+    monkeypatch.setattr(ab.subprocess, "run", _missing)
+    assert ab._resolve_region({}) is None
+
+
 def test_claude_settings_env_handles_missing_file(tmp_state, monkeypatch):
     tmp, _, _ = tmp_state
     monkeypatch.setattr(ab, "HOST_CLAUDE_SETTINGS", tmp / "nope.json")

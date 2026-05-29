@@ -148,13 +148,42 @@ def _resolve_profile(cfg: Dict[str, Any]) -> Optional[str]:
     )
 
 
+def _aws_configured_region(profile: Optional[str]) -> Optional[str]:
+    """Ask the host's ``aws`` CLI for the resolved region of *profile*.
+
+    ``aws configure get region`` walks the same precedence the SDK uses:
+    profile-specific ``region =`` line, then ``[default]``, then nothing.
+    Cheap (~50 ms; no network).  Returns None if the CLI is missing,
+    fails, or prints an empty value.
+    """
+    argv = ["aws", "configure", "get", "region"]
+    if profile:
+        argv += ["--profile", profile]
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    region = result.stdout.strip()
+    return region or None
+
+
 def _resolve_region(cfg: Dict[str, Any]) -> Optional[str]:
-    """Pick the AWS region, same priority order as the profile."""
+    """Pick the AWS region.  Priority order:
+
+    1. Explicit ``region`` in ``~/.config/yolo-jail/aws-broker.jsonc``.
+    2. ``AWS_REGION`` from the host's ``~/.claude/settings.json`` env block.
+    3. ``AWS_REGION`` / ``AWS_DEFAULT_REGION`` from the broker process env.
+    4. The resolved profile's ``region =`` line in ``~/.aws/config``,
+       read via ``aws configure get region`` (which honors the same
+       SDK-default precedence rules ``aws sts`` uses internally).
+    """
+    profile = _resolve_profile(cfg)
     return (
         cfg.get("region")
         or _claude_settings_env("AWS_REGION")
         or os.environ.get("AWS_REGION")
         or os.environ.get("AWS_DEFAULT_REGION")
+        or _aws_configured_region(profile)
     )
 
 
@@ -387,7 +416,9 @@ def _self_check() -> int:
             return f"from {HOST_CLAUDE_SETTINGS} (env block)"
         if os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"):
             return "from broker process env"
-        return "(unresolved — aws CLI default)"
+        if _aws_configured_region(profile):
+            return f"from ~/.aws/config (profile {profile or 'default'})"
+        return "(unresolved)"
 
     print(f"config: {CONFIG_PATH} ({'present' if CONFIG_PATH.exists() else 'absent'})")
     print(f"profile: {profile or '(none)'}  [{_profile_source()}]")
