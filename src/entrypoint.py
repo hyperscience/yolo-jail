@@ -2062,8 +2062,44 @@ from src.cli import main
 main()
 ''')
     bootstrap_py.chmod(0o755)
+    # Resolve ``uv`` defensively: never accept a uv from a workspace
+    # venv's bin/ — those can be:
+    #   - foreign-arch (host built the venv, jail runs Linux);
+    #   - self-referential symlinks (a known broken-state we've seen);
+    #   - missing entirely while still leading PATH via mise's
+    #     ``_.python.venv`` activation.
+    # All three break ``exec uv run``.  Prefer ``mise which uv`` (mise
+    # bypasses venv shadowing and points at its real install dir);
+    # fall back to the first PATH-resolved ``uv`` whose realpath is
+    # NOT under any ``.venv/bin``; finally fall back to the literal
+    # ``uv`` PATH lookup so the shim still works in environments
+    # without mise.
     script_path.write_text(f"""#!/bin/bash
-exec uv run --no-project --with typer --with rich --with "pyjson5>=2.0.0" \
+# Find a working uv, skipping workspace venv shadowing.
+_yolo_uv=""
+if command -v mise >/dev/null 2>&1; then
+    _yolo_uv=$(mise which uv 2>/dev/null) || _yolo_uv=""
+fi
+if [ -z "$_yolo_uv" ] || [ ! -x "$_yolo_uv" ]; then
+    # Walk PATH for a uv whose canonical path isn't under a .venv.
+    _IFS_save=$IFS; IFS=:
+    for _dir in $PATH; do
+        IFS=$_IFS_save
+        _candidate="$_dir/uv"
+        [ -x "$_candidate" ] || continue
+        case "$(readlink -f "$_candidate" 2>/dev/null || echo "$_candidate")" in
+            */.venv/bin/uv) continue ;;
+        esac
+        _yolo_uv="$_candidate"
+        break
+    done
+    IFS=$_IFS_save
+fi
+[ -n "$_yolo_uv" ] || _yolo_uv=uv  # let exec fail loudly if nothing found
+# Unset VIRTUAL_ENV so uv doesn't try to consume the (potentially
+# broken) workspace venv when launching the bootstrap python.
+unset VIRTUAL_ENV
+exec "$_yolo_uv" run --no-project --with typer --with rich --with "pyjson5>=2.0.0" \\
   -- python "{bootstrap_py}" "$@"
 """)
     script_path.chmod(0o755)
