@@ -1,0 +1,43 @@
+// Bundled yolo-jail loophole — AWS credential broker for Bedrock.
+//
+// A host-side daemon mints short-lived STS session credentials from
+// the user's host AWS configuration (profile, SSO, role chains —
+// whatever the host's `aws` CLI knows how to use) and serves them
+// over a unix socket to the jail.  Inside the jail, ~/.aws/config is
+// configured with `credential_process = yolo-aws-creds` so the AWS
+// SDK invokes the helper whenever it needs credentials; the helper
+// connects to the socket, prints the JSON the SDK expects, and
+// exits.  No long-lived AWS keys ever cross into the jail.
+//
+// Configuration: ~/.config/yolo-jail/aws-broker.jsonc on the host
+//
+//   {
+//     "profile": "bedrock",
+//     "region": "us-east-1",            // optional; defaults to host AWS_REGION / AWS_DEFAULT_REGION
+//     "session_duration_seconds": 3600, // optional; clamped to STS limits (900..43200)
+//     "role_arn": "arn:aws:iam::..."    // optional; switches to sts:AssumeRole
+//   }
+//
+// When the loophole is active the jail entrypoint also injects
+// CLAUDE_CODE_USE_BEDROCK=1 and AWS_REGION into the jail's
+// settings.json env block so Claude Code routes to Bedrock by default.
+//
+// No TLS interception, no CA, no jail-side daemon.
+{
+  "name": "aws-credential-broker",
+  "description": "Host-side AWS credential broker. Mints short-lived STS sessions from the host's AWS configuration and serves them to the jail via credential_process. Long-lived AWS keys never enter the jail.",
+  "version": 1,
+  "enabled": true,
+  // Activation precondition: the host's ``aws`` CLI must be on PATH.
+  // We use it to talk to STS — sidesteps adding boto3 as a dependency
+  // and inherits whatever SSO / config the host already has set up.
+  "requires": {
+    "command_on_path": "aws"
+  },
+  "transport": "unix-socket",
+  "lifecycle": "spawned",
+  "host_daemon": {
+    "cmd": ["yolo-aws-credential-broker", "--socket", "{socket}"]
+  },
+  "doctor_cmd": ["yolo-aws-credential-broker", "--self-check"]
+}

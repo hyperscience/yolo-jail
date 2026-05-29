@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""yolo-jail jail-side credential_process for the aws-credential-broker loophole.
+
+Configured in the jail's ~/.aws/config as ``credential_process``.  The
+AWS SDK invokes us when it needs credentials; we open the unix socket
+the host daemon listens on, ask for credentials whose remaining
+lifetime exceeds CLAUDE_CODE_API_KEY_HELPER_TTL_MS (or 60s default),
+and print the SDK's expected JSON shape to stdout.  On any failure we
+exit non-zero with a clear stderr explanation that the SDK surfaces
+to the agent / shell.
+
+AWS credential_process protocol:
+  https://docs.aws.amazon.com/sdkref/latest/guide/feature-process-credentials.html
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import struct
+import sys
+from typing import Any, Dict, Optional
+
+
+STREAM_STDOUT = 0
+STREAM_STDERR = 1
+STREAM_EXIT = 2
+
+
+SOCKET_ENV_VAR = "YOLO_SERVICE_AWS_CREDENTIAL_BROKER_SOCKET"
+
+
+def _recv_all(conn: socket.socket, n: int) -> "Optional[bytes]":
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _read_response(conn: socket.socket) -> "tuple[Optional[Dict[str, Any]], int, str]":
+    stdout_buf = bytearray()
+    stderr_buf = bytearray()
+    rc = 1
+    while True:
+        header = _recv_all(conn, 5)
+        if header is None:
+            break
+        stream_id, length = struct.unpack(">BI", header)
+        payload = _recv_all(conn, length) if length else b""
+        if payload is None:
+            break
+        if stream_id == STREAM_STDOUT:
+            stdout_buf.extend(payload)
+        elif stream_id == STREAM_STDERR:
+            stderr_buf.extend(payload)
+        elif stream_id == STREAM_EXIT:
+            (rc,) = struct.unpack(">i", payload)
+            break
+    parsed: Optional[Dict[str, Any]] = None
+    text = stdout_buf.decode("utf-8", errors="replace").strip()
+    if text:
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+    return parsed, rc, stderr_buf.decode("utf-8", errors="replace")
+
+
+def _ttl_ms() -> int:
+    """Use CLAUDE_CODE_API_KEY_HELPER_TTL_MS as the floor when set so
+    Bedrock-via-Claude-Code matches the jail's overall TTL discipline.
+    Fallback: 60s, same as the Anthropic broker."""
+    raw = os.environ.get("CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "60000")
+    try:
+        return int(raw)
+    except ValueError:
+        return 60_000
+
+
+def _fail(msg: str, *, recommendation: Optional[str] = None) -> int:
+    print(f"yolo-aws-creds: {msg}", file=sys.stderr)
+    if recommendation:
+        print(f"yolo-aws-creds: recommendation: {recommendation}", file=sys.stderr)
+    return 1
+
+
+def main() -> int:
+    sock_path = os.environ.get(SOCKET_ENV_VAR)
+    if not sock_path:
+        return _fail(
+            f"{SOCKET_ENV_VAR} unset — aws-credential-broker loophole is "
+            "not wired up for this jail",
+            recommendation=(
+                "ensure the loophole is enabled in yolo-jail.jsonc and "
+                "restart the jail (yolo --new)"
+            ),
+        )
+
+    try:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.connect(sock_path)
+    except OSError as e:
+        return _fail(
+            f"cannot reach broker socket {sock_path}: {e}",
+            recommendation=(
+                "host daemon may not be running; restart the jail or run "
+                "`yolo doctor` on the host"
+            ),
+        )
+
+    request = json.dumps({"min_lifetime_ms": _ttl_ms()}).encode()
+    try:
+        conn.sendall(struct.pack(">I", len(request)))
+        conn.sendall(request)
+        parsed, rc, stderr_text = _read_response(conn)
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    if parsed is None:
+        return _fail(
+            f"broker returned malformed response (rc={rc}): {stderr_text or '(no stderr)'}"
+        )
+
+    if "error" in parsed:
+        error = parsed.get("error", "unknown_error")
+        message = parsed.get("message", "(no message)")
+        recommendation = parsed.get("recommendation")
+        return _fail(f"{error}: {message}", recommendation=recommendation)
+
+    # Success: emit the AWS-SDK-shape JSON verbatim, minus our internal
+    # ``expires_in_ms`` field.  The SDK is lenient about extra fields
+    # but we keep stdout clean.
+    out = {
+        k: v
+        for k, v in parsed.items()
+        if k in ("Version", "AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration")
+    }
+    sys.stdout.write(json.dumps(out))
+    sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

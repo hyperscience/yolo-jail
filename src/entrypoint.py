@@ -1318,6 +1318,49 @@ def _ensure_credentials_symlink():
     link.symlink_to(target)
 
 
+def configure_aws_credentials():
+    """Wire the aws-credential-broker loophole into the jail's AWS SDK.
+
+    When the loophole is active (its socket env var is set) we write
+    ~/.aws/config with a ``credential_process`` line pointing at the
+    in-jail helper.  No-op when the loophole isn't wired.
+
+    AWS SDKs read ~/.aws/config in profile order; we set the [default]
+    profile here so any AWS SDK call works without explicit profile
+    selection.  If the user has their own ~/.aws/config we extend it
+    with a ``[profile yolo]`` block instead and set AWS_PROFILE=yolo.
+    """
+    sock_env = os.environ.get("YOLO_SERVICE_AWS_CREDENTIAL_BROKER_SOCKET")
+    if not sock_env:
+        return
+
+    aws_dir = HOME / ".aws"
+    aws_dir.mkdir(parents=True, exist_ok=True)
+    config_path = aws_dir / "config"
+
+    helper_path = "yolo-aws-creds"  # found via PATH inside the jail
+    region = os.environ.get("YOLO_AWS_REGION") or os.environ.get("AWS_REGION") or ""
+
+    profile_block_lines = [
+        "credential_process = " + helper_path,
+    ]
+    if region:
+        profile_block_lines.append(f"region = {region}")
+    profile_block = "\n".join(profile_block_lines) + "\n"
+
+    if not config_path.exists() or config_path.stat().st_size == 0:
+        # Fresh config — own [default].
+        config_path.write_text("[default]\n" + profile_block)
+    else:
+        existing = config_path.read_text()
+        if "credential_process = " + helper_path in existing:
+            return  # already wired
+        # Append a [profile yolo] block; entrypoint env exports
+        # AWS_PROFILE=yolo so SDK calls pick it up.
+        with config_path.open("a") as f:
+            f.write("\n[profile yolo]\n" + profile_block)
+
+
 def configure_claude():
     """Set up Claude Code: settings.json (permissions, plugins) + ~/.claude.json (MCP)."""
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1409,6 +1452,24 @@ def configure_claude():
         ):
             settings["apiKeyHelper"] = "yolo-claude-creds"
             settings["env"]["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"] = "60000"
+
+        # Wire aws-credential-broker as the Bedrock auth source.  Active
+        # only when the loophole's socket env var is bind-mounted into
+        # the jail (configure_aws_credentials writes the matching
+        # ~/.aws/config).  Tells Claude Code to route to Bedrock by
+        # default; AWS_REGION is needed because Bedrock is region-scoped
+        # and Claude Code's Bedrock client errors without it.  Users can
+        # disable this loophole per-workspace to opt out of Bedrock.
+        if os.environ.get("YOLO_SERVICE_AWS_CREDENTIAL_BROKER_SOCKET"):
+            env_block = settings.setdefault("env", {})
+            env_block["CLAUDE_CODE_USE_BEDROCK"] = "1"
+            region = (
+                os.environ.get("YOLO_AWS_REGION")
+                or os.environ.get("AWS_REGION")
+                or os.environ.get("AWS_DEFAULT_REGION")
+            )
+            if region:
+                env_block["AWS_REGION"] = region
 
         # Enable LSP plugins matching the jail's configured LSP servers.
         lsp_servers = _load_lsp_servers()
@@ -2198,6 +2259,8 @@ def main():
     _perf("configure_copilot")
     configure_gemini()
     _perf("configure_gemini")
+    configure_aws_credentials()
+    _perf("configure_aws_credentials")
     configure_claude()
     _perf("configure_claude")
     setup_cgroup_delegation()
