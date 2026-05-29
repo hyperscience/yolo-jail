@@ -81,6 +81,14 @@ auto-converts from Nix's streamed image tar using (in priority order):
 1. **skopeo** (recommended — no daemon needed): `brew install skopeo`
 2. **podman** (needs running daemon as fallback)
 
+**Networking quirks (macOS 15):** Apple Container on Darwin 24.x has a
+vmnet limitation that can leave containers without outbound internet
+even though the bridge gateway is reachable. The cause and remediation
+steps are upstream:
+[Apple Container — macOS 15 limitations](https://github.com/apple/container/blob/main/docs/technical-overview.md#macos-15-limitations).
+If `yolo` containers can ping `192.168.64.1` but can't reach the
+internet, that page is the first place to look.
+
 ### Nix Linux Builder (optional, binary cache substitution used by default)
 
 The OCI image contains Linux binaries (`aarch64-linux` or `x86_64-linux`).
