@@ -14,7 +14,7 @@ On first run the daemon needs an Anthropic identity. It tries, in order:
 1. The legacy `~/.local/share/yolo-jail/home/.claude-shared-credentials/.credentials.json` from the old MITM broker — auto-migrated if present (one-shot capture, then the broker forks its chain by performing an immediate refresh).
 2. The host's own `~/.claude/.credentials.json` — same one-shot capture.
 
-The capture step calls Anthropic's refresh endpoint immediately so the broker holds a fresh refresh token *before* the source identity does its next refresh. This is what keeps the two chains independent — the [2026-04-23 incident comments in the legacy broker](../../oauth_broker.py) describe the failure mode that motivates the fork.
+The capture step calls Anthropic's refresh endpoint immediately so the broker holds a fresh refresh token *before* the source identity does its next refresh. This is what keeps the two chains independent — Anthropic single-uses refresh tokens, so two independent OAuth clients (host Claude Code and yolo-jail's broker) cannot safely share one without one of them periodically losing the race. Forking on capture eliminates the failure mode entirely.
 
 If neither source has credentials, the helper fails non-zero with a message telling the user to run `claude` on the host once and complete `/login` first.
 

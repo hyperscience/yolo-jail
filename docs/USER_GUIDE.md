@@ -115,7 +115,7 @@ Required if you want the Claude OAuth broker primed via `just deploy`, or if you
 ```bash
 git clone https://github.com/mschulkind-oss/yolo-jail.git
 cd yolo-jail
-just deploy      # builds + installs yolo CLI + primes claude-oauth-broker state
+just deploy      # builds + installs the yolo CLI
 ```
 
 `just deploy` is idempotent and safe to re-run.
@@ -171,17 +171,29 @@ gemini login           # Google Gemini CLI
 claude                 # Runs /login on first launch
 ```
 
-Tokens are stored in `~/.local/share/yolo-jail/home/` on the host (same path on Linux and macOS) and persist across jail restarts. You do **not** need to re-authenticate each time, and on podman a `/login` in any jail propagates to every other jail automatically.
+Tokens are stored in `~/.local/share/yolo-jail/home/` on the host (same path on Linux and macOS) and persist across jail restarts. You do **not** need to re-authenticate each time.
 
-### Claude OAuth broker (refresh serialization)
+### Claude credential broker
 
-Anthropic uses single-use refresh tokens — when multiple jails share the same `.credentials.json` and two of them try to refresh in the same window, one loses the race and gets logged out. YOLO Jail ships the **claude-oauth-broker** loophole: a host-side daemon that serializes refreshes behind a flock. Jails route their refresh requests through it instead of calling Anthropic directly.
+Anthropic auth inside the jail goes through the **claude-credential-broker** loophole: a host-side daemon owns the OAuth refresh-token chain in `~/.local/share/yolo-jail/state/claude-credential-broker/credentials.json` and answers requests over a unix socket. Inside the jail, Claude Code's `apiKeyHelper` (a tiny script baked into the image at `/usr/local/bin/yolo-claude-creds`) calls the daemon every `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` ms to fetch the current access token; the daemon refreshes proactively when remaining lifetime would not cover the next interval.
 
-The broker refreshes on demand — when a jail asks for a refresh, if the on-disk token has headroom we return it cached, otherwise we refresh upstream once and hand the result back. No background timer, no proactive refresh, no wasted refresh-token rotations.
+On first use the daemon bootstraps from your host's `~/.claude/.credentials.json` (or the legacy MITM-broker shared file if you're upgrading) by performing an immediate refresh against Anthropic — the result is stored in the broker's own state file and never reads from the source again. The two refresh-token chains diverge cleanly: host Claude and yolo-jail's broker hold independent refresh tokens that won't invalidate each other.
 
-`just deploy` primes the broker's CA + leaf certs into `~/.local/share/yolo-jail/state/claude-oauth-broker/`. Jails activate the loophole automatically when `claude` is on PATH. `yolo doctor` includes a broker self-check covering cert state and credentials parseability.
+If the daemon can't supply a token whose lifetime exceeds the jail's TTL setting (refresh failure, revoked token, TTL set higher than Anthropic's access-token lifetime can satisfy), the helper exits non-zero with a stderr message including a recommended TTL value to lower to. Claude Code surfaces apiKeyHelper failures to the agent so it can pass the recommendation back to the user.
 
-> **Security note:** Auth tokens are stored separately from your host credentials. The jail never accesses your host `~/.ssh/`, `~/.gitconfig`, or cloud credentials. The broker refreshes `~/.local/share/yolo-jail/home/.claude/.credentials.json` and, when it shares the same refresh token as your host `~/.claude/.credentials.json`, mirrors the new tokens there too so host Claude Code stays logged in.
+`yolo broker status` runs each broker's `--self-check` and reports state. `yolo broker refresh` forces an immediate refresh.
+
+> **Security note:** Auth tokens are stored separately from your host credentials. The jail never reads your host `~/.ssh/`, `~/.gitconfig`, or cloud credentials. The broker's `credentials.json` lives in yolo-jail's state dir and the broker never writes back to the host's `~/.claude/.credentials.json`.
+
+### AWS credential broker (Bedrock)
+
+When Claude Code is configured to use Bedrock instead of direct Anthropic, the **aws-credential-broker** loophole serves credentials. Configure with `~/.config/yolo-jail/aws-broker.jsonc`:
+
+```jsonc
+{ "profile": "bedrock", "region": "us-east-1", "session_duration_seconds": 3600 }
+```
+
+The host daemon shells out to `aws sts get-session-token` (or `assume-role` if `role_arn` is set) and serves short-lived credentials to the jail's AWS SDK via the `credential_process` mechanism in `~/.aws/config`. Long-lived AWS keys never enter the jail. When the loophole is active, the entrypoint also injects `CLAUDE_CODE_USE_BEDROCK=1` and `AWS_REGION` into the jail's settings so Claude Code routes to Bedrock by default.
 
 ---
 
@@ -1002,11 +1014,12 @@ yolo check --no-build         # fast — skip nix build
 - macOS (any runtime): File ownership is mediated by the VM's virtiofs layer; files inside `/workspace` appear as the jail user and on the host appear as you
 - If persistent, check `ls -la ~/.local/share/yolo-jail/home/`
 
-**Claude keeps logging out across jails**
+**Claude API errors inside the jail**
 
-- Full triage walkthrough: [docs/claude-token-logouts.md](claude-token-logouts.md). It maps each `yolo doctor` symptom to a fix.
-- Background: Anthropic rotates refresh tokens single-use, so multiple jails refreshing simultaneously race each other. The `claude-oauth-broker` loophole (bundled, active by default when `claude` is on PATH) serializes refreshes behind an `flock` on the host so jails can't race — eliminating the class entirely.
-- Run `yolo check` and look at the Loopholes section for broker health. Common recoveries: `yolo-claude-oauth-broker-host --init-ca` if certs are missing, then restart your jail.
+- The `claude-credential-broker` loophole (bundled, active by default when `claude` is on the host PATH) is the auth source. Run `yolo broker status` to see daemon state.
+- "Could not load credentials" / 401 on first use: the broker has no identity yet. Run `claude` on the host once and complete `/login`; the broker bootstraps from `~/.claude/.credentials.json` on its next request.
+- "ttl_too_long: …" stderr from `yolo-claude-creds`: lower `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` in the jail's `~/.claude/settings.json` env block to the value the recommendation prints.
+- "refresh_failed: …": refresh token revoked or network failure. Run `claude /login` on the host to mint a fresh refresh token, then `rm ~/.local/share/yolo-jail/state/claude-credential-broker/credentials.json` to force re-bootstrap.
 
 ### Linux-Specific Issues
 

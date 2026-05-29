@@ -1922,13 +1922,11 @@ class TestMainFunction:
 
 class TestSupervisorSingleInstance:
     """``start_jail_daemon_supervisor`` must be idempotent across repeated
-    entrypoint invocations.  Root cause of duplicated supervisors (see
-    handover follow-up #3): entrypoint.main() runs on every ``podman
-    exec yolo-entrypoint <cmd>``, calling us; each extra supervisor
-    forks a fresh oauth_broker_jail that tries to bind :443 and
-    crashloops with EADDRINUSE.  Guard with a PID file + liveness
-    probe so re-entrant exec calls observe the existing supervisor and
-    no-op."""
+    entrypoint invocations.  entrypoint.main() runs on every ``podman
+    exec yolo-entrypoint <cmd>``, calling us; without a guard each extra
+    supervisor would fork duplicate jail-side daemons.  PID file +
+    liveness probe so re-entrant exec calls observe the existing
+    supervisor and no-op."""
 
     def _set_daemons_env(self, monkeypatch):
         """Supervisor is only spawned when YOLO_JAIL_DAEMONS is non-empty."""

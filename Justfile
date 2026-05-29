@@ -80,66 +80,28 @@ deploy: install
         systemctl --user daemon-reload 2>/dev/null || true
     fi
 
-    # --- Claude OAuth broker loophole (bundled) ---
-    # The manifest ships inside the yolo-jail wheel under
-    # src/bundled_loopholes/claude-oauth-broker/ — the loader finds it
-    # automatically whenever yolo-jail is installed.  The loophole's
-    # ``requires.command_on_path: claude`` predicate gates activation,
-    # so there's no separate "is Claude installed" check here.
+    # --- Credential broker loopholes (bundled) ---
+    # claude-credential-broker (Anthropic OAuth) and aws-credential-broker
+    # (Bedrock STS) ship inside the yolo-jail wheel and need no
+    # pre-priming — they bootstrap on first request from existing host
+    # state (~/.claude/.credentials.json for Anthropic, ~/.aws/* for AWS).
+    # Activation is gated by the manifests' ``requires.command_on_path``
+    # predicate.
     #
-    # The only host-install step: pre-generate the CA + leaf into the
-    # writable state dir so jails have something to trust on first
-    # boot.  Also retires any pre-bundled-era install artifacts.
-    if ! command -v openssl >/dev/null 2>&1; then
-        echo "⚠ openssl not found — skipping claude-oauth-broker state init"
-    else
-        BROKER_BIN="$(command -v yolo-claude-oauth-broker-host || true)"
-        if [ -z "$BROKER_BIN" ]; then
-            echo "ERROR: yolo-claude-oauth-broker-host not on PATH after install" >&2
-            exit 1
-        fi
-
-        # Retire stale copies of the manifest from pre-bundled installs.
-        rm -rf "$HOME/.local/share/yolo-jail/modules/claude-oauth-broker"
-        if [ -d "$HOME/.local/share/yolo-jail/loopholes/claude-oauth-broker" ]; then
-            # Move any generated state into the new state dir before
-            # removing the legacy copy (the manifest lives in the wheel
-            # now, but CA/leaf files shouldn't be lost).
-            STATE_DIR="$HOME/.local/share/yolo-jail/state/claude-oauth-broker"
-            mkdir -p "$STATE_DIR"
-            for f in ca.crt ca.key server.crt server.key refresh.lock; do
-                src_f="$HOME/.local/share/yolo-jail/loopholes/claude-oauth-broker/$f"
-                [ -f "$src_f" ] && mv "$src_f" "$STATE_DIR/$f" 2>/dev/null || true
-            done
-            rm -rf "$HOME/.local/share/yolo-jail/loopholes/claude-oauth-broker"
-            echo "  migrated legacy loopholes/claude-oauth-broker → bundled + state split"
-        fi
-        # Retire the pre-split systemd unit if present.
-        if command -v systemctl >/dev/null 2>&1; then
-            if systemctl --user is-enabled claude-oauth-broker.service >/dev/null 2>&1; then
-                systemctl --user disable --now claude-oauth-broker.service 2>/dev/null || true
-                rm -f "$HOME/.config/systemd/user/claude-oauth-broker.service"
-                systemctl --user daemon-reload
-                echo "  retired pre-split claude-oauth-broker.service"
+    # Retire pre-bundled artifacts from the legacy MITM broker if they
+    # linger from older installs.
+    rm -rf "$HOME/.local/share/yolo-jail/modules/claude-oauth-broker"
+    rm -rf "$HOME/.local/share/yolo-jail/loopholes/claude-oauth-broker"
+    rm -rf "$HOME/.local/share/yolo-jail/state/claude-oauth-broker"
+    if command -v systemctl >/dev/null 2>&1; then
+        for unit in claude-oauth-broker.service; do
+            if systemctl --user is-enabled "$unit" >/dev/null 2>&1; then
+                systemctl --user disable --now "$unit" 2>/dev/null || true
+                rm -f "$HOME/.config/systemd/user/$unit"
+                echo "  retired legacy $unit"
             fi
-        fi
-
-        # Generate CA + leaf in the state dir (idempotent).
-        "$BROKER_BIN" --init-ca >/dev/null
-
-        echo "✓ claude-oauth-broker state primed at $HOME/.local/share/yolo-jail/state/claude-oauth-broker"
-        echo "  manifest is bundled in the wheel; loophole activates automatically when Claude is on PATH"
-    fi
-
-    # Cycle the singleton broker so this deploy's wheel code is live
-    # immediately.  Previously, an old broker process could outlive
-    # `just deploy` (different process, same filesystem) and serve
-    # requests with stale Python loaded in memory — the 2026-04-24
-    # incident.  `yolo broker restart` kills + respawns; next `yolo
-    # run` also does lazy-spawn-if-missing, so this is belt AND
-    # suspenders.
-    if command -v yolo >/dev/null 2>&1; then
-        yolo broker restart 2>&1 | sed 's/^/  /' || true
+        done
+        systemctl --user daemon-reload 2>/dev/null || true
     fi
 
     echo "yolo-jail deployed. Verify: yolo loopholes list"

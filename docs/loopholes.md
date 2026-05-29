@@ -4,7 +4,8 @@ A **loophole** is a single controlled permeability point between the jail and th
 
 Examples:
 
-- [`claude-oauth-broker`](../loopholes/claude-oauth-broker/) — MITM proxy that serializes Claude OAuth refreshes (transport: `tls-intercept`, lifecycle: `external`).
+- `claude-credential-broker` — serves Anthropic OAuth tokens to the jail's `apiKeyHelper` over a unix socket; host daemon owns the OAuth refresh-token chain (transport: `unix-socket`, lifecycle: `spawned`).
+- `aws-credential-broker` — mints short-lived STS sessions from the host's AWS configuration and serves them via `credential_process` (transport: `unix-socket`, lifecycle: `spawned`).
 - `host-processes` — allowlisted read-only view of host processes (transport: `unix-socket`, lifecycle: `spawned`).
 - `journal`, `cgroup-delegate` — built-in loopholes surfaced from `loopholes` in `yolo-jail.jsonc`.
 - Hypothetical future: `llm-audit` (logs every inference request), `secret-gate` (scrubs outbound traffic).
@@ -144,9 +145,8 @@ Keeps the briefing tight and prevents drift when loopholes come and go.
 ## See also
 
 - [`docs/loophole-protocol.md`](loophole-protocol.md) — wire protocol spec.
-- [`loopholes/claude-oauth-broker/`](../loopholes/claude-oauth-broker/) — reference `tls-intercept` implementation.
+- [`src/bundled_loopholes/claude-credential-broker/`](../src/bundled_loopholes/claude-credential-broker/) — Anthropic credential broker (reference `unix-socket` + `apiKeyHelper` pattern).
+- [`src/bundled_loopholes/aws-credential-broker/`](../src/bundled_loopholes/aws-credential-broker/) — AWS STS credential broker (reference `credential_process` pattern).
 - [`src/loopholes.py`](../src/loopholes.py) — loader source (docstring has the canonical schema).
 - [`src/host_service.py`](../src/host_service.py) — helper library.
-- [`src/host_processes.py`](../src/host_processes.py) — reference `unix-socket` consumer of the library.
-- [`docs/claude-oauth-mitm-proxy-plan.md`](claude-oauth-mitm-proxy-plan.md) — design notes that shaped this architecture.
-- [`docs/claude-token-logouts.md`](claude-token-logouts.md) — operational triage for Claude logouts; the broker loophole is Step 3's fix.
+- [`src/host_processes.py`](../src/host_processes.py) — additional `unix-socket` consumer of the library.

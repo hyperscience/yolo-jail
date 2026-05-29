@@ -3089,10 +3089,10 @@ class TestHostServices:
             with patch("cli._resolve_container_cgroup", return_value=None):
                 handles = start_loopholes(cname, "podman", config)
             # The user spec is silently dropped.  Bundled loopholes
-            # (claude-oauth-broker, host-processes, …) may appear
-            # depending on the host — but the user's attempted shadow
-            # must NOT be among the returned names (that's the
-            # invariant under test here).
+            # (claude-credential-broker, aws-credential-broker,
+            # host-processes, …) may appear depending on the host — but
+            # the user's attempted shadow must NOT be among the
+            # returned names (that's the invariant under test here).
             names = [h.name for h in handles]
             assert (
                 BUILTIN_CGROUP_LOOPHOLE_NAME
