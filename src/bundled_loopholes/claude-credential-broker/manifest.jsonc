@@ -1,0 +1,36 @@
+// Bundled yolo-jail loophole — replaces the legacy claude-oauth-broker
+// MITM design with a pure unix-socket credential service.
+//
+// Inside the jail, ~/.claude/settings.json is configured with
+// ``apiKeyHelper`` pointing at /usr/local/bin/yolo-claude-creds.  When
+// Claude Code needs an Anthropic auth value it invokes the helper; the
+// helper opens this loophole's socket, asks for a token whose lifetime
+// covers ``CLAUDE_CODE_API_KEY_HELPER_TTL_MS``, and prints it on stdout.
+//
+// The host daemon owns its own OAuth refresh-token chain in
+// ~/.local/share/yolo-jail/state/claude-credential-broker/credentials.json
+// — bootstrapped on first use from the host's ~/.claude/.credentials.json
+// (or migrated from the legacy ~/.local/share/yolo-jail/home/.claude-shared-credentials/
+// file when upgrading).  After bootstrap the daemon never reads the
+// host file again — host Claude and the broker hold separate, concurrent
+// refresh-token chains, sidestepping the 2026-04-23 invalid_grant class.
+//
+// No TLS interception, no CA, no jail-side daemon.  See
+// docs/loopholes.md for the loophole framework.
+{
+  "name": "claude-credential-broker",
+  "description": "Host-side Anthropic credential broker. Inside the jail Claude Code's apiKeyHelper hits a unix socket; the host daemon owns the OAuth refresh-token chain and returns short-lived access tokens. Replacement for claude-oauth-broker (MITM-free).",
+  "version": 1,
+  "enabled": true,
+  // Activation precondition: only meaningful when Claude Code is on
+  // the host's PATH (so the bootstrap-from-host-creds path can run).
+  "requires": {
+    "command_on_path": "claude"
+  },
+  "transport": "unix-socket",
+  "lifecycle": "spawned",
+  "host_daemon": {
+    "cmd": ["yolo-claude-credential-broker", "--socket", "{socket}"]
+  },
+  "doctor_cmd": ["yolo-claude-credential-broker", "--self-check"]
+}

@@ -37,6 +37,7 @@ Issues = "https://github.com/mschulkind-oss/yolo-jail/issues"
 
 [project.scripts]
 yolo = "src.cli:main"
+yolo-claude-credential-broker = "src.credential_broker:main"
 yolo-claude-oauth-broker-host = "src.oauth_broker:main"
 yolo-host-processes = "src.host_processes:main"
 yolo-ps = "src.yolo_ps:main"

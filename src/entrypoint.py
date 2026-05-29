@@ -1393,6 +1393,23 @@ def configure_claude():
         # Enable LSP tool so Claude Code uses language servers for navigation.
         settings.setdefault("env", {})["ENABLE_LSP_TOOL"] = "1"
 
+        # Wire claude-credential-broker as the Anthropic auth source.
+        # The host-side daemon exposes a unix socket bind-mounted into
+        # the jail; ``yolo-claude-creds`` is the apiKeyHelper script
+        # baked into the jail's PATH (src/shims/yolo-claude-creds).
+        # CLAUDE_CODE_API_KEY_HELPER_TTL_MS controls how often Claude
+        # Code re-invokes the helper; 60s is a safe default given that
+        # Anthropic access tokens are typically ~1h and the broker
+        # refreshes proactively when the remaining lifetime would not
+        # exceed TTL + 60s lead.  The broker fails the helper non-zero
+        # with a stderr recommendation if this TTL is set higher than
+        # the access-token lifetime can satisfy.
+        if shutil.which("yolo-claude-creds") is not None or (
+            (HOME / ".local" / "bin" / "yolo-claude-creds").exists()
+        ):
+            settings["apiKeyHelper"] = "yolo-claude-creds"
+            settings["env"]["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"] = "60000"
+
         # Enable LSP plugins matching the jail's configured LSP servers.
         lsp_servers = _load_lsp_servers()
         enabled_plugins = settings.setdefault("enabledPlugins", {})

@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""yolo-jail jail-side apiKeyHelper for the claude-credential-broker loophole.
+
+Configured in the jail's ~/.claude/settings.json as ``apiKeyHelper``.
+Claude Code re-invokes us every CLAUDE_CODE_API_KEY_HELPER_TTL_MS ms.
+
+Protocol with the host daemon: send a length-prefixed JSON request
+``{"min_lifetime_ms": N}``; receive framed stream-id/payload responses
+matching ``src/host_service.py``.  We surface stdout (the JSON reply)
+or stderr (failure explanation), then exit with the daemon's code.
+
+On any failure we exit non-zero with a recommendation to stderr —
+Claude Code surfaces apiKeyHelper failures to the agent so it can ask
+the user to act.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import struct
+import sys
+from typing import Any, Dict, Optional
+
+
+STREAM_STDOUT = 0
+STREAM_STDERR = 1
+STREAM_EXIT = 2
+
+
+# Mirrors the loophole's socket env-var convention used by other shims
+# (see yolo-ps for the prior art).  Set by yolo run when the loophole
+# is active for this jail.
+SOCKET_ENV_VAR = "YOLO_SERVICE_CLAUDE_CREDENTIAL_BROKER_SOCKET"
+
+
+def _recv_all(conn: socket.socket, n: int) -> "Optional[bytes]":
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _read_response(conn: socket.socket) -> "tuple[Optional[Dict[str, Any]], int, str]":
+    """Drain framed response.  Returns (parsed_json_or_None, exit_code,
+    stderr_text).  parsed_json is None when stdout wasn't valid JSON."""
+    stdout_buf = bytearray()
+    stderr_buf = bytearray()
+    rc = 1
+    while True:
+        header = _recv_all(conn, 5)
+        if header is None:
+            break
+        stream_id, length = struct.unpack(">BI", header)
+        payload = _recv_all(conn, length) if length else b""
+        if payload is None:
+            break
+        if stream_id == STREAM_STDOUT:
+            stdout_buf.extend(payload)
+        elif stream_id == STREAM_STDERR:
+            stderr_buf.extend(payload)
+        elif stream_id == STREAM_EXIT:
+            (rc,) = struct.unpack(">i", payload)
+            break
+    parsed: Optional[Dict[str, Any]] = None
+    text = stdout_buf.decode("utf-8", errors="replace").strip()
+    if text:
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+    return parsed, rc, stderr_buf.decode("utf-8", errors="replace")
+
+
+def _ttl_ms() -> int:
+    """Read CLAUDE_CODE_API_KEY_HELPER_TTL_MS from the environment.
+    Default to 60_000 (matches what the jail's settings.json sets)."""
+    raw = os.environ.get("CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "60000")
+    try:
+        return int(raw)
+    except ValueError:
+        return 60_000
+
+
+def _fail(msg: str, *, recommendation: Optional[str] = None) -> int:
+    print(f"yolo-claude-creds: {msg}", file=sys.stderr)
+    if recommendation:
+        print(f"yolo-claude-creds: recommendation: {recommendation}", file=sys.stderr)
+    return 1
+
+
+def main() -> int:
+    sock_path = os.environ.get(SOCKET_ENV_VAR)
+    if not sock_path:
+        return _fail(
+            f"{SOCKET_ENV_VAR} unset — claude-credential-broker loophole is "
+            "not wired up for this jail",
+            recommendation=(
+                "ensure the loophole is enabled in yolo-jail.jsonc and "
+                "restart the jail (yolo --new)"
+            ),
+        )
+
+    try:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.connect(sock_path)
+    except OSError as e:
+        return _fail(
+            f"cannot reach broker socket {sock_path}: {e}",
+            recommendation=(
+                "host daemon may not be running; restart the jail or run "
+                "`yolo doctor` on the host"
+            ),
+        )
+
+    ttl_ms = _ttl_ms()
+    request = json.dumps({"min_lifetime_ms": ttl_ms}).encode()
+    try:
+        conn.sendall(struct.pack(">I", len(request)))
+        conn.sendall(request)
+        parsed, rc, stderr_text = _read_response(conn)
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    if parsed is None:
+        return _fail(
+            f"broker returned malformed response (rc={rc}): {stderr_text or '(no stderr)'}"
+        )
+
+    if "token" in parsed:
+        sys.stdout.write(parsed["token"])
+        sys.stdout.flush()
+        return 0
+
+    # Error path — daemon already shaped a recommendation; surface it.
+    error = parsed.get("error", "unknown_error")
+    message = parsed.get("message", "(no message)")
+    recommendation = parsed.get("recommendation")
+    return _fail(f"{error}: {message}", recommendation=recommendation)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
