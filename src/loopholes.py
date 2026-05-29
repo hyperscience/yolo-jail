@@ -4,8 +4,12 @@ A **loophole** is a single controlled permeability point between the jail
 and the host: the jail talks to something through the loophole, and
 nothing escapes that's not declared.  Examples:
 
-- ``claude-oauth-broker`` — MITM proxy that serializes Claude OAuth refreshes
-  (transport: ``tls-intercept``, lifecycle: ``external``).
+- ``claude-credential-broker`` — Anthropic OAuth tokens served via a unix
+  socket; jail's apiKeyHelper hits the daemon (transport: ``unix-socket``,
+  lifecycle: ``spawned``).
+- ``aws-credential-broker`` — short-lived STS sessions for Bedrock; jail's
+  AWS SDK reaches the daemon via ``credential_process`` (transport:
+  ``unix-socket``, lifecycle: ``spawned``).
 - ``host-processes`` — read-only allowlisted view of host processes
   (transport: ``unix-socket``, lifecycle: ``spawned``).
 - ``llm-audit`` (hypothetical third-party) — logs every inference request
@@ -29,15 +33,15 @@ Manifest schema (v1)
 .. code-block:: jsonc
 
     {
-      "name": "claude-oauth-broker",            // required, must match dir name
+      "name": "claude-credential-broker",        // required, must match dir name
       "description": "…",                        // required
       "version": 1,                              // manifest format version
       "enabled": true,                           // default true
-      "transport": "tls-intercept",              // or "unix-socket" or "none"
-      "lifecycle": "external",                   // or "spawned"
+      "transport": "unix-socket",                // or "tls-intercept" or "none"
+      "lifecycle": "spawned",                    // or "external"
       "intercepts": [                            // DNS override inside the jail
-        {"host": "platform.claude.com"}
-      ],
+        {"host": "platform.claude.com"}          //   (only meaningful for
+      ],                                         //    transport: tls-intercept)
       "broker_ip": "127.0.0.1",                  // where the intercept points;
                                                   // use "127.0.0.1" to route to
                                                   // a jail-side daemon, or
@@ -52,7 +56,7 @@ Manifest schema (v1)
       // socket is bind-mounted into the jail; the daemon's cmd
       // receives the host-side socket path as ``{socket}``.
       "host_daemon": {
-        "cmd": ["yolo-claude-oauth-broker-host", "--socket", "{socket}"],
+        "cmd": ["yolo-claude-credential-broker", "--socket", "{socket}"],
         "env": {"MY_VAR": "val"}
       },
 

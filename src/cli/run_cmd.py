@@ -53,14 +53,9 @@ from .config import (
 from .console import console
 from .image import _jail_image, auto_load_image
 from .loopholes_runtime import (
-    BROKER_LOOPHOLE_NAME,
-    BROKER_SINGLETON_SOCKET,
-    _broker_ensure,
     _gpu_host_available,
-    _host_service_env_var,
     _host_service_sockets_dir,
     _should_mount_host_nix,
-    _start_broker_relay,
     start_loopholes,
     stop_loopholes,
 )
@@ -759,8 +754,9 @@ def run(
     # files that already exist (the entrypoint regenerates configs each time).
     _seed_agent_dir(GLOBAL_HOME / ".copilot", ws_state / "copilot")
     _seed_agent_dir(GLOBAL_HOME / ".gemini", ws_state / "gemini")
-    # Credentials are in the shared dir (.claude-shared-credentials/), not
-    # .claude/, so no skip needed — _seed_agent_dir won't encounter them.
+    # Anthropic credentials are no longer mounted into the jail — the
+    # claude-credential-broker loophole serves them on demand via the
+    # apiKeyHelper unix socket.  See src/credential_broker.py.
     _seed_agent_dir(GLOBAL_HOME / ".claude", ws_state / "claude")
 
     # Seed claude.json onboarding state into the per-workspace overlay.
@@ -813,13 +809,9 @@ def run(
         # base + 15 individual per-workspace writable overlays (which would use
         # 16 slots), mount ws_state as a single writable /home/agent.
         # Auth tokens are already seeded into ws_state from GLOBAL_HOME above.
-        #
-        # Note: Apple Container cannot do the cross-jail shared .credentials.json
-        # rw mount (one bind mount per file would push us over the device limit).
-        # On AC, each workspace has its own credentials file; cross-jail /login
-        # propagation requires podman on macOS, or running the
-        # host-side claude-oauth-broker which refreshes against the
-        # GLOBAL_HOME source.
+        # Anthropic credentials flow through the claude-credential-broker
+        # loophole (apiKeyHelper unix socket), so no per-jail or shared
+        # .credentials.json mount is required on Apple Container either.
         run_cmd = [
             runtime,
             "run",
@@ -903,14 +895,8 @@ def run(
             f"{ws_state / 'gemini'}:/home/agent/.gemini",
             "-v",
             f"{ws_state / 'claude'}:/home/agent/.claude",
-            # Shared credentials dir — mounted rw so /login in any jail
-            # persists for all jails.  Using a directory mount (not a
-            # single-file mount) because Claude Code's IWH atomic writer
-            # uses tmp+rename which returns EBUSY on single-file bind
-            # mounts.  The entrypoint creates a symlink from
-            # .claude/.credentials.json → this dir so Claude finds it.
-            "-v",
-            f"{GLOBAL_HOME / '.claude-shared-credentials'}:/home/agent/.claude-shared-credentials",
+            # No .credentials.json mount — Anthropic auth flows through
+            # the claude-credential-broker loophole's apiKeyHelper.
             # Other per-workspace overlays
             "-v",
             f"{ws_state / 'bash_history'}:/home/agent/.bash_history",
@@ -1299,46 +1285,6 @@ def run(
         run_cmd.extend(
             ["-v", f"{host_services_sockets_dir}:{JAIL_HOST_SERVICES_DIR}:rw"]
         )
-        # Claude OAuth broker singleton — eagerly ensure it's alive
-        # BEFORE we add the bind-mount flag so the socket source path
-        # exists at the moment podman tries to set up the mount.
-        # ``start_loopholes`` (called later) also calls _broker_ensure
-        # for idempotence, but putting it here too means the mount
-        # never fails for want of a source.
-        try:
-            _broker_ensure()
-        except Exception as e:  # noqa: BLE001 — never fail run() on this
-            console.print(
-                f"[yellow]claude-oauth-broker: singleton not ensured pre-mount: {e}[/yellow]"
-            )
-        if BROKER_SINGLETON_SOCKET.exists():
-            _broker_jail_socket = (
-                f"{JAIL_HOST_SERVICES_DIR}/{BROKER_LOOPHOLE_NAME}.sock"
-            )
-            if IS_MACOS:
-                # Podman Machine on macOS cannot bind-mount a Unix socket
-                # *file* (EOPNOTSUPP).  Socket files that live *inside* a
-                # mounted directory are accessible via the virtiofs dir
-                # mount.  Start a relay inside host_services_sockets_dir;
-                # no extra -v flag needed — the relay socket is already
-                # visible at {JAIL_HOST_SERVICES_DIR}/{BROKER_LOOPHOLE_NAME}.sock
-                # through the directory mount above.
-                _relay_path = host_services_sockets_dir / f"{BROKER_LOOPHOLE_NAME}.sock"
-                _start_broker_relay(_relay_path, BROKER_SINGLETON_SOCKET.resolve())
-            else:
-                run_cmd.extend(
-                    [
-                        "-v",
-                        f"{BROKER_SINGLETON_SOCKET.resolve()}:{_broker_jail_socket}:rw",
-                    ]
-                )
-            # The jail-side TLS terminator reads
-            # YOLO_SERVICE_CLAUDE_OAUTH_BROKER_SOCKET to find the
-            # broker.  start_loopholes no longer synthesizes this env
-            # (singleton doesn't come back as a LoopholeDaemon handle)
-            # so inject it explicitly.
-            _broker_env_var = _host_service_env_var(BROKER_LOOPHOLE_NAME)
-            run_cmd.extend(["-e", f"{_broker_env_var}={_broker_jail_socket}"])
 
     # Device passthrough from config
     # On macOS, device passthrough goes through the container runtime's VM.

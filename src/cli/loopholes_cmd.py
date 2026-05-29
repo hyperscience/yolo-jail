@@ -85,7 +85,7 @@ def loopholes_list():
 def loopholes_status():
     """Run each loophole's doctor_cmd and report."""
     # doctor_cmd entries are host-side console scripts (e.g.
-    # yolo-claude-oauth-broker-host --self-check) — they aren't
+    # yolo-claude-credential-broker --self-check) — they aren't
     # installed inside the jail.  Running them from the jail just
     # surfaces confusing ENOENT output.  Tell the operator where to
     # run the checks instead.

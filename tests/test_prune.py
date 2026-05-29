@@ -613,13 +613,11 @@ class TestPruneShadowedHome:
     def test_registry_excludes_seeded_agent_dirs(self):
         """``~/.copilot``, ``~/.gemini``, ``~/.claude`` under GLOBAL_HOME
         feed ``_seed_agent_dir`` on first boot of a new workspace — they
-        are NOT shadowed.  Must not appear in the registry.  Also
-        ``.claude-shared-credentials`` is the rw shared-auth dir itself."""
+        are NOT shadowed.  Must not appear in the registry."""
         forbidden = {
             ".copilot",
             ".gemini",
             ".claude",
-            ".claude-shared-credentials",
         }
         for entry in prune.SHADOWED_HOME_PATHS:
             top = entry.split("/", 1)[0]

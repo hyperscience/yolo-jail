@@ -74,7 +74,6 @@ GEMINI_DIR = HOME / ".gemini"
 GEMINI_MANAGED_MCP_PATH = GEMINI_DIR / "yolo-managed-mcp-servers.json"
 CLAUDE_DIR = HOME / ".claude"
 CLAUDE_MANAGED_MCP_PATH = CLAUDE_DIR / "yolo-managed-mcp-servers.json"
-CLAUDE_SHARED_CREDENTIALS_DIR = HOME / ".claude-shared-credentials"
 MISE_CONFIG_DIR = HOME / ".config" / "mise"
 
 # Writable tmpfs that backs the ``/etc/localtime`` + ``/etc/timezone``
@@ -1282,42 +1281,6 @@ def _isolate_claude_history():
     history_file.symlink_to(per_jail)
 
 
-def _ensure_credentials_symlink():
-    """Ensure .claude/.credentials.json is a symlink into the shared credentials dir.
-
-    The shared credentials directory is a rw directory bind mount, so Claude
-    Code's IWH atomic writer (readlinkSync → tmp → rename) works correctly.
-    The old approach — a single-file bind mount — caused EBUSY on rename,
-    forcing the fallback truncate+write path which can lose data in races.
-    """
-    link = CLAUDE_DIR / ".credentials.json"
-    target = Path("..") / ".claude-shared-credentials" / ".credentials.json"
-
-    if link.is_symlink():
-        try:
-            if Path(os.readlink(str(link))) == target:
-                return  # already correct
-        except OSError:
-            pass
-        link.unlink()
-    elif link.exists():
-        # Migration: existing regular file (from old single-file bind mount era).
-        # Copy its data to the shared dir if the shared dir's copy is missing
-        # or empty, then replace with symlink.
-        shared = CLAUDE_SHARED_CREDENTIALS_DIR / ".credentials.json"
-        if not shared.exists() or shared.stat().st_size == 0:
-            try:
-                shutil.copy2(str(link), str(shared))
-            except OSError:
-                pass
-        try:
-            link.unlink()
-        except OSError:
-            return  # can't remove — leave as-is (still works via fallback write)
-
-    link.symlink_to(target)
-
-
 def configure_aws_credentials():
     """Wire the aws-credential-broker loophole into the jail's AWS SDK.
 
@@ -1369,12 +1332,6 @@ def configure_claude():
     claude_json_path = HOME / ".claude.json"
 
     configured_servers = _load_mcp_servers()
-
-    # Ensure .credentials.json is a symlink into the shared credentials dir.
-    # Claude Code's IWH atomic writer resolves symlinks before writing, so
-    # tmp+rename happens in the directory mount (where rename works) instead
-    # of on the old single-file bind mount (where rename returned EBUSY).
-    _ensure_credentials_symlink()
 
     # Sync non-settings host claude files first
     _sync_host_claude_files()

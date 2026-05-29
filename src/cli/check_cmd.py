@@ -37,8 +37,6 @@ from .config import (
 from .console import console
 from .image import _build_image_store_path, _jail_image
 from .loopholes_runtime import (
-    BROKER_LOOPHOLE_NAME,
-    _broker_status,
     _host_service_sockets_dir,
 )
 from .paths import (
@@ -127,86 +125,6 @@ def _check_disk_usage(
         ok(f"yolo-jail disk usage: {human} (threshold {threshold_gb:.0f} GiB)")
 
 
-def _check_broker_creds_freshness(ok, warn, fail) -> None:
-    """Symptom-level health check on the shared Claude credentials.
-
-    The broker exists to keep
-    ``~/.local/share/yolo-jail/home/.claude-shared-credentials/.credentials.json``
-    valid — its ``expiresAt`` should always be comfortably in the
-    future.  When refreshes fail to land (Claude not asking, broker
-    crash, server-side revocation, …) the symptom is the same:
-    expiresAt approaches now and nothing rewrites the file.
-
-    This is the actually-useful metric the 2026-04-28 handoff called
-    for: surface the symptom directly so we don't have to wait for a
-    user to hit a 401 to find out refreshes have stopped.
-
-    Caveat: a fresh-looking ``expiresAt`` can still hide a
-    server-revoked refresh token (observed 2026-04-28); only a real
-    network roundtrip can prove validity.  That's a planned follow-up.
-    """
-    creds_path = GLOBAL_HOME / ".claude-shared-credentials" / ".credentials.json"
-    if not creds_path.exists():
-        # First /login hasn't happened yet — nothing to grade.
-        return
-    try:
-        # ``ensure_global_storage`` touches an empty placeholder file so
-        # the bind-mount target exists on first boot.  Treat zero-byte
-        # as the documented pre-login state (same as "file absent"),
-        # not as a corruption warning.
-        if creds_path.stat().st_size == 0:
-            return
-    except OSError:
-        pass
-    try:
-        data = json.loads(creds_path.read_text())
-        expires_at_ms = int(data["claudeAiOauth"]["expiresAt"])
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as e:
-        warn(
-            f"shared creds {creds_path}: unreadable",
-            f"{type(e).__name__}: {e}",
-        )
-        return
-
-    now_ms = int(time.time() * 1000)
-    remaining_s = (expires_at_ms - now_ms) // 1000
-    # File mtime is a proxy for "time since last refresh" — every
-    # successful refresh-grant or /login rewrites the file.  Flat
-    # mtime + advancing wall-clock = nothing is landing.
-    try:
-        mtime_age_s = int(time.time() - creds_path.stat().st_mtime)
-    except OSError:
-        mtime_age_s = -1
-
-    def _fmt(seconds: int) -> str:
-        if seconds < 0:
-            return "?"
-        if seconds < 3600:
-            return f"{seconds // 60}m"
-        return f"{seconds // 3600}h{(seconds % 3600) // 60}m"
-
-    last_write = f"last write {_fmt(mtime_age_s)} ago" if mtime_age_s >= 0 else ""
-
-    if remaining_s < 0:
-        fail(
-            f"shared creds expired {_fmt(-remaining_s)} ago"
-            + (f" ({last_write})" if last_write else ""),
-            "Refreshes are not landing.  Run /login from inside a "
-            "jail to recover; check broker log at "
-            "~/.local/share/yolo-jail/logs/host-service-claude-oauth-broker.log",
-        )
-    elif remaining_s < 3600:
-        warn(
-            f"shared creds expire in {_fmt(remaining_s)}"
-            + (f" ({last_write})" if last_write else ""),
-            "Approaching expiry without a refresh having landed.  "
-            "Healthy cadence keeps this above 1h.",
-        )
-    else:
-        suffix = f", {last_write}" if last_write else ""
-        ok(f"shared creds valid for {_fmt(remaining_s)}{suffix}")
-
-
 def _check_loopholes(ok, warn, fail) -> None:
     """Surface loophole discovery + each loophole's own self-check.
 
@@ -243,45 +161,6 @@ def _check_loopholes(ok, warn, fail) -> None:
         r = results[0]
         if r.returncode == 0:
             ok(f"loophole {loophole.name}: self-check ok")
-            # Broker gets an additional runtime probe: self_check
-            # validates static state (CA files, creds parseable) but
-            # can't tell whether the daemon is actually answering.
-            # This is the check that would have caught the 2026-04-24
-            # stale-wheel incident in doctor instead of at
-            # /login-prompt time.
-            if loophole.name == BROKER_LOOPHOLE_NAME:
-                # Symptom-level: are the shared creds about to expire?
-                # Liveness above only tells us the daemon is up; this
-                # tells us whether refreshes are actually landing.
-                _check_broker_creds_freshness(ok, warn, fail)
-                status = _broker_status()
-                if status["pid_live"] and status["ping_ok"]:
-                    ok(
-                        "loophole claude-oauth-broker: daemon live "
-                        f"(pid={status['pid']}, ping ok)"
-                    )
-                elif status["pid"] is None:
-                    warn(
-                        "loophole claude-oauth-broker: daemon not running",
-                        "First `yolo run` will spawn it; "
-                        "`yolo broker status` reports state, "
-                        "`yolo broker restart` cycles.",
-                    )
-                elif not status["pid_live"]:
-                    fail(
-                        "loophole claude-oauth-broker: stale PID file, "
-                        f"pid {status['pid']} not running",
-                        "Run `yolo broker restart` to clean up and respawn.",
-                    )
-                else:
-                    fail(
-                        "loophole claude-oauth-broker: daemon unresponsive "
-                        f"(pid={status['pid']}, socket "
-                        f"{'present' if status['socket_exists'] else 'missing'}, "
-                        "ping failed)",
-                        "Run `yolo broker restart` — typical after a "
-                        "wheel upgrade; old code still loaded in memory.",
-                    )
         elif r.returncode is None:
             warn(
                 f"loophole {loophole.name}: self-check could not run",
@@ -388,16 +267,6 @@ def _check_host_service_liveness(ok, warn, fail) -> None:
     for cname in cnames:
         sockets_dir = _host_service_sockets_dir(cname)
         for lp in externals:
-            # Singleton broker: its per-jail entry is a bind-mount
-            # placeholder (zero-byte regular file on the host;
-            # connect() against it raises ENOTSOCK).  Liveness for
-            # the singleton is checked separately in
-            # ``_check_loopholes`` via ``_broker_status`` against the
-            # well-known singleton path.  Probing here was producing
-            # ``socket dead`` false positives that sent investigators
-            # down the wrong trail (handoff 2026-04-28).
-            if lp.name == BROKER_LOOPHOLE_NAME:
-                continue
             sock_path = sockets_dir / f"{lp.name}.sock"
             label = f"loophole {lp.name} @ {cname}"
             if not sock_path.exists():

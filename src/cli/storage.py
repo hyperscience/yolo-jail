@@ -46,10 +46,6 @@ def ensure_global_storage():
         ".copilot",
         ".gemini",
         ".claude",
-        # Shared credentials dir — all jails mount this rw as a directory so
-        # Claude Code's atomic writer (tmp+rename) works.  The old approach
-        # used a single-file bind mount which returned EBUSY on rename.
-        ".claude-shared-credentials",
         Path(".config") / "git",
         ".npm-global",
         ".local",
@@ -60,22 +56,6 @@ def ensure_global_storage():
         ".ssh",
     ]:
         (GLOBAL_HOME / subdir).mkdir(parents=True, exist_ok=True)
-    # Migrate credentials from old single-file mount location to new shared dir.
-    old_cred = GLOBAL_HOME / ".claude" / ".credentials.json"
-    new_cred = GLOBAL_HOME / ".claude-shared-credentials" / ".credentials.json"
-    if old_cred.is_file() and not old_cred.is_symlink():
-        if not new_cred.exists() or new_cred.stat().st_size == 0:
-            try:
-                shutil.copy2(old_cred, new_cred)
-            except OSError:
-                pass
-        try:
-            old_cred.unlink()
-        except OSError:
-            pass  # may have restrictive perms — leave for now
-    # Ensure the credentials file exists in the shared dir (touch for mountpoint).
-    if not new_cred.exists():
-        new_cred.touch()
     # File mountpoints — these must exist as files (not dirs) for bind mounts.
     # Only create if missing — existing files from prior runs may have restrictive
     # permissions from container UID mapping; we just need them to exist.

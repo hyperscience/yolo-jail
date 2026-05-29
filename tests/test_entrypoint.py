@@ -45,7 +45,6 @@ def jail_home(tmp_path, monkeypatch):
         "GEMINI_MANAGED_MCP_PATH",
         "CLAUDE_DIR",
         "CLAUDE_MANAGED_MCP_PATH",
-        "CLAUDE_SHARED_CREDENTIALS_DIR",
         "MISE_CONFIG_DIR",
     ]
     for attr in attrs:
@@ -68,7 +67,6 @@ def jail_home(tmp_path, monkeypatch):
     entrypoint.CLAUDE_MANAGED_MCP_PATH = (
         tmp_path / ".claude" / "yolo-managed-mcp-servers.json"
     )
-    entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR = tmp_path / ".claude-shared-credentials"
     entrypoint.MISE_CONFIG_DIR = tmp_path / ".config" / "mise"
 
     yield tmp_path
@@ -1047,50 +1045,6 @@ class TestClaudeConfig:
         entrypoint.configure_claude()
         cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
         assert "mcpServers" not in cfg
-
-    def test_credentials_symlink_created(self, jail_home):
-        """configure_claude creates a symlink from .claude/.credentials.json
-        to the shared credentials dir so Claude's atomic writer works."""
-        entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
-        (entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR / ".credentials.json").touch()
-        entrypoint.configure_claude()
-        link = entrypoint.CLAUDE_DIR / ".credentials.json"
-        assert link.is_symlink()
-        assert (
-            os.readlink(str(link)) == "../.claude-shared-credentials/.credentials.json"
-        )
-
-    def test_credentials_symlink_migrates_existing_file(self, jail_home):
-        """If .credentials.json is a regular file (old setup), its data is
-        migrated to the shared dir and replaced with a symlink."""
-        entrypoint.CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
-        entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
-        # Old-style regular file with valid credentials
-        cred_data = (
-            '{"claudeAiOauth": {"accessToken": "test", "expiresAt": 9999999999}}'
-        )
-        (entrypoint.CLAUDE_DIR / ".credentials.json").write_text(cred_data)
-        (entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR / ".credentials.json").touch()
-
-        entrypoint.configure_claude()
-
-        link = entrypoint.CLAUDE_DIR / ".credentials.json"
-        assert link.is_symlink()
-        # Data should have been migrated to shared dir
-        shared = entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR / ".credentials.json"
-        assert "test" in shared.read_text()
-
-    def test_credentials_symlink_idempotent(self, jail_home):
-        """Running configure_claude twice doesn't break the symlink."""
-        entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
-        (entrypoint.CLAUDE_SHARED_CREDENTIALS_DIR / ".credentials.json").touch()
-        entrypoint.configure_claude()
-        entrypoint.configure_claude()
-        link = entrypoint.CLAUDE_DIR / ".credentials.json"
-        assert link.is_symlink()
-        assert (
-            os.readlink(str(link)) == "../.claude-shared-credentials/.credentials.json"
-        )
 
 
 # -- MCP wrappers --

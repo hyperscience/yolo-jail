@@ -579,7 +579,6 @@ def _disk_usage_report(*, workspaces: Iterable[Path], global_storage: Path) -> d
 # NOT listed (intentionally):
 #   - .copilot / .gemini / .claude — seeded by _seed_agent_dir on every
 #     new workspace; deleting the base would break first-boot auth.
-#   - .claude-shared-credentials — rw shared-credential mount point.
 #   - .config — bind-mounted over but the seed may carry non-auth
 #     content the entrypoint relies on; too risky to add without audit.
 # ---------------------------------------------------------------------------

@@ -809,12 +809,12 @@ def test_workspace_inline_when_no_matching_manifest(mods_dir: Path):
 
 
 def test_bundled_loopholes_discovered_by_default():
-    # claude-oauth-broker ships with the wheel and should be discoverable
-    # without include_bundled=True (which is the default).
+    # claude-credential-broker ships with the wheel and should be
+    # discoverable without include_bundled=True (which is the default).
     loaded = loopholes.discover_loopholes(include_disabled=True)
     names = [m.name for m in loaded]
-    assert "claude-oauth-broker" in names
-    broker = next(m for m in loaded if m.name == "claude-oauth-broker")
+    assert "claude-credential-broker" in names
+    broker = next(m for m in loaded if m.name == "claude-credential-broker")
     assert broker.source == loopholes.SOURCE_BUNDLED
 
 
@@ -822,18 +822,18 @@ def test_user_overrides_bundled_by_name(tmp_path: Path):
     # User-installed loophole with same name as bundled takes precedence.
     user_dir = tmp_path / "user"
     user_dir.mkdir()
-    overlay = user_dir / "claude-oauth-broker"
+    overlay = user_dir / "claude-credential-broker"
     overlay.mkdir()
     _write_manifest(
         overlay,
         {
-            "name": "claude-oauth-broker",
+            "name": "claude-credential-broker",
             "description": "local override",
             "enabled": False,
         },
     )
     loaded = loopholes.discover_loopholes(root=user_dir, include_disabled=True)
-    broker = [m for m in loaded if m.name == "claude-oauth-broker"]
+    broker = [m for m in loaded if m.name == "claude-credential-broker"]
     assert len(broker) == 1  # not duplicated
     assert broker[0].source == loopholes.SOURCE_USER
     assert broker[0].description == "local override"

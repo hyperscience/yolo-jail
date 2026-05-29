@@ -154,26 +154,12 @@ from .agents_md import (
     generate_agents_md,
 )
 from .loopholes_runtime import (
-    BROKER_LOOPHOLE_NAME,
-    BROKER_SINGLETON_LOCK,
-    BROKER_SINGLETON_PID_FILE,
-    BROKER_SINGLETON_SOCKET,
     JOURNAL_FRAME_EXIT,
     JOURNAL_FRAME_STDERR,
     JOURNAL_FRAME_STDOUT,
     JOURNAL_MAX_ARG_LEN,
     JOURNAL_MAX_ARGS,
     LoopholeDaemon,
-    _broker_ensure,
-    _broker_is_alive,
-    _broker_kill,
-    _broker_pgrep_strays,
-    _broker_pid_is_live,
-    _broker_ping,
-    _broker_read_pid,
-    _broker_spawn,
-    _broker_status,
-    _broker_wait_for_socket,
     _cgd_create_and_join,
     _cgd_destroy,
     _cgd_ensure_agent_cgroup,
@@ -187,7 +173,6 @@ from .loopholes_runtime import (
     _parse_memory_value,
     _resolve_journal_mode,
     _should_mount_host_nix,
-    _start_broker_relay,
     _start_host_service_builtin_cgroup,
     _start_host_service_builtin_journal,
     _start_host_service_external,
@@ -324,7 +309,6 @@ from .init_cmd import (  # noqa: E402
 from .config_ref_cmd import config_ref  # noqa: E402
 from .prune_cmd import _fmt_bytes, prune_cmd  # noqa: E402
 from .check_cmd import (  # noqa: E402
-    _check_broker_creds_freshness,
     _check_disk_usage,
     _check_host_service_liveness,
     _check_loopholes,
