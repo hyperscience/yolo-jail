@@ -989,12 +989,16 @@ def start_loopholes(
 
     handles: List[LoopholeDaemon] = []
 
-    # Apple Container doesn't support Unix socket bind mounts at all (it
-    # can't share the sockets dir into the jail), so we skip host services
-    # entirely there.  The sockets dir still gets created above so any
-    # subsequent per-file bind mounts don't fail.
+    # Apple Container caveats:
+    #   - Cannot bind-mount the sockets *directory* into the jail
+    #     (virtiofs directory shares don't carry AF_UNIX inodes
+    #     correctly).  ``run_cmd.py`` uses per-socket ``-v`` mounts
+    #     instead — see the ``runtime == "container"`` branch there.
+    #   - The cgroup delegate is Linux-only regardless of runtime.
     if runtime == "container":
-        return handles
+        # Apple Container: skip the directory-mount path; host services
+        # still spawn so per-socket bind mounts above work.
+        pass
 
     # 1. Built-in cgroup delegate (Linux only, cgroup v2 only).
     builtin = _start_host_service_builtin_cgroup(cname, runtime, sockets_dir)

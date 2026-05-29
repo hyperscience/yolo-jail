@@ -1266,16 +1266,21 @@ def run(
             socket_dir = _host_tmp / f"yolo-fwd-{cname}"
             run_cmd.extend(["-v", f"{socket_dir}:/tmp/yolo-fwd:rw"])
 
-    # Host services: bind-mount the per-jail sockets directory into the jail
-    # at /run/yolo-services/.  Each service (built-in cgroup delegate,
-    # user-configured external services from `loopholes` in config) drops
-    # its Unix socket here.  Apple Container can't share Unix sockets via
-    # virtiofs, so we skip the mount entirely there — start_loopholes()
-    # also returns no handles in that case.
+    # Host services: bind-mount each loophole's Unix socket into the jail
+    # at /run/yolo-services/<name>.sock.  The sockets dir lives under /tmp
+    # (not ws_state!) because Linux's AF_UNIX path limit is 108 bytes and
+    # a deep workspace path blows it.  See _host_service_sockets_dir().
     #
-    # The sockets dir lives under /tmp (not ws_state) because Linux's
-    # AF_UNIX path limit is 108 bytes and a deep workspace path blows it.
-    # See _host_service_sockets_dir() docstring.
+    # podman: bind-mount the whole sockets directory.  Sockets created
+    # inside it after the mount are visible to the jail through the
+    # virtiofs dir share — the standard pattern.
+    #
+    # Apple Container: directory-mode virtiofs shares don't carry AF_UNIX
+    # inodes correctly, so the per-jail directory mount approach doesn't
+    # work.  Instead we spawn loopholes first (start_loopholes call below)
+    # and then emit per-socket ``-v`` flags.  AC's virtiofs DOES propagate
+    # AF_UNIX inodes correctly when the source path is a socket file
+    # itself; verified empirically on AC 0.12.3.
     host_services_sockets_dir = _host_service_sockets_dir(cname)
     if runtime != "container":
         host_services_sockets_dir.mkdir(parents=True, exist_ok=True)
@@ -1285,6 +1290,12 @@ def run(
         run_cmd.extend(
             ["-v", f"{host_services_sockets_dir}:{JAIL_HOST_SERVICES_DIR}:rw"]
         )
+    else:
+        # Apple Container path: ensure the sockets dir exists for the
+        # daemons to bind in, but don't mount it into the jail.  Per-socket
+        # mounts are added AFTER start_loopholes — see the splice block
+        # below.
+        host_services_sockets_dir.mkdir(parents=True, exist_ok=True)
 
     # Device passthrough from config
     # On macOS, device passthrough goes through the container runtime's VM.
@@ -1723,10 +1734,22 @@ def run(
         # extend at the end — the image and command args are already in
         # the run command at this point.
         image_idx = run_cmd.index(_jail_image(runtime))
-        run_cmd[image_idx:image_idx] = [
+        inserts: list[str] = [
             "-e",
             f"{svc.env_var_name}={svc.jail_socket_path}",
         ]
+        # Apple Container: emit a per-socket ``-v`` mount, since the
+        # directory-mount path is skipped above.  For podman the
+        # directory mount is sufficient and per-socket mounts would
+        # collide with the parent-dir share.
+        if runtime == "container":
+            inserts.extend(
+                [
+                    "-v",
+                    f"{svc.host_socket_path}:{svc.jail_socket_path}",
+                ]
+            )
+        run_cmd[image_idx:image_idx] = inserts
 
     run_cmd.append(final_internal_cmd)
 
