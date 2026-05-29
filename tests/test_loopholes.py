@@ -466,6 +466,80 @@ def test_requires_command_on_path_active_when_present(mods_dir: Path):
     assert loaded[0].inactive_reason is None
 
 
+def test_inside_jail_uses_socket_env_var_not_predicate(mods_dir: Path, monkeypatch):
+    """Inside the jail, ``requires`` predicates from the manifest should
+    NOT be re-evaluated against the jail's PATH/filesystem — the jail
+    has different binaries and paths than the host did when the loophole
+    was wired.  Activation is determined solely by whether the host
+    injected the loophole's socket env var (YOLO_SERVICE_<NAME>_SOCKET).
+
+    Regression test: aws-credential-broker has ``command_on_path: aws``
+    but the jail image doesn't ship the aws CLI.  Re-evaluating that
+    predicate in the jail incorrectly reported the loophole as inactive
+    while the host daemon was actually serving credentials over the
+    bind-mounted socket.
+    """
+    mod = mods_dir / "needs-host-only-bin"
+    mod.mkdir()
+    _write_manifest(
+        mod,
+        {
+            "name": "needs-host-only-bin",
+            "description": "x",
+            "requires": {"command_on_path": "xyz-never-exists-abc"},
+        },
+    )
+    # Pretend we're inside a jail.
+    monkeypatch.setenv("YOLO_VERSION", "1.2.3")
+
+    loaded = loopholes.discover_loopholes(mods_dir, include_bundled=False)
+    lp = loaded[0]
+
+    # No socket env var → the host did NOT wire this loophole into the
+    # jail.  ``requirements_met`` honors that, even though we'd never
+    # find the host-only binary on the jail's PATH either.
+    monkeypatch.delenv(
+        "YOLO_SERVICE_NEEDS_HOST_ONLY_BIN_SOCKET", raising=False
+    )
+    assert lp.requirements_met is False
+    assert lp.active is False
+    assert "not wired into this jail" in (lp.inactive_reason or "")
+
+    # Host injected the socket env var → loophole is active in this
+    # jail, regardless of the host-only binary being absent inside.
+    monkeypatch.setenv(
+        "YOLO_SERVICE_NEEDS_HOST_ONLY_BIN_SOCKET",
+        "/run/yolo-services/needs-host-only-bin.sock",
+    )
+    assert lp.requirements_met is True
+    assert lp.active is True
+    assert lp.inactive_reason is None
+
+
+def test_outside_jail_predicate_still_evaluated(mods_dir: Path, monkeypatch):
+    """Sanity: the in-jail bypass only kicks in when YOLO_VERSION is set.
+    On the host, the manifest predicate is still authoritative."""
+    mod = mods_dir / "needs-xyz"
+    mod.mkdir()
+    _write_manifest(
+        mod,
+        {
+            "name": "needs-xyz",
+            "description": "x",
+            "requires": {"command_on_path": "xyz-never-exists-abc"},
+        },
+    )
+    monkeypatch.delenv("YOLO_VERSION", raising=False)
+    # Even with the socket env var set, on the host we'd still evaluate
+    # the predicate.  (yolo run never sets these env vars on the host
+    # process anyway, but be explicit.)
+    monkeypatch.delenv("YOLO_SERVICE_NEEDS_XYZ_SOCKET", raising=False)
+
+    loaded = loopholes.discover_loopholes(mods_dir, include_bundled=False)
+    assert loaded[0].requirements_met is False
+    assert "xyz-never-exists-abc" in (loaded[0].inactive_reason or "")
+
+
 # ---------------------------------------------------------------------------
 # requires.file_exists — "host has this socket/file" activation gate
 # ---------------------------------------------------------------------------

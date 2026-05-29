@@ -221,8 +221,38 @@ class Loophole:
     def has_ca(self) -> bool:
         return self.ca_cert is not None and self.ca_cert.is_file()
 
+    @staticmethod
+    def _running_inside_jail() -> bool:
+        """True when the current process is running inside a jail.
+
+        The jail entrypoint sets YOLO_VERSION; the host CLI never does.
+        """
+        import os as _os
+
+        return _os.environ.get("YOLO_VERSION") is not None
+
+    def _jail_socket_env_var(self) -> str:
+        """The env var the host CLI injects into the jail when this
+        loophole is wired (``YOLO_SERVICE_<NAME>_SOCKET``).  Used to
+        decide activation from inside the jail without re-evaluating
+        host-side predicates that don't apply there."""
+        import re as _re
+
+        sanitized = _re.sub(r"[^A-Za-z0-9]+", "_", self.name).strip("_").upper()
+        return f"YOLO_SERVICE_{sanitized}_SOCKET"
+
     @property
     def requirements_met(self) -> bool:
+        # Inside the jail: the host already evaluated ``requires`` when
+        # spawning loopholes.  Re-evaluating against the jail's PATH /
+        # filesystem produces wrong answers (e.g. the ``aws`` CLI lives
+        # on the host, not in the jail image).  Trust the host's
+        # decision as recorded in the socket env var.
+        import os as _os
+
+        if self._running_inside_jail():
+            return bool(_os.environ.get(self._jail_socket_env_var()))
+
         req = self.requires
         if req.command_on_path is not None:
             import shutil as _shutil
@@ -248,6 +278,17 @@ class Loophole:
         or None if it's active.  Used by ``yolo loopholes list``."""
         if not self.enabled:
             return "disabled"
+        if self._running_inside_jail():
+            # Inside the jail, "inactive" can only mean "the host
+            # didn't wire this loophole into this jail."  We can't tell
+            # *why* the host decided that — the original predicate
+            # evaluation happened outside our process tree.
+            import os as _os
+
+            if not _os.environ.get(self._jail_socket_env_var()):
+                return "not wired into this jail (run `yolo loopholes` on the host for the reason)"
+            return None
+
         req = self.requires
         if req.command_on_path is not None:
             import shutil as _shutil
