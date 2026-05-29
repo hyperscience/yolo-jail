@@ -1518,6 +1518,16 @@ def run(
     # keeps resolving one level deeper. The path is identical inside and out.
     run_cmd.extend(["-e", f"YOLO_OUTER_MISE_PATH={host_mise}"])
     run_cmd.extend(["-e", f"MISE_DISABLE_TOOLS={mise_disabled_tools}"])
+    # Tell project ``.mise.toml`` files to use a jail-specific venv path so
+    # host-built and jail-built venvs don't overwrite each other inside
+    # /workspace.  Project opts in via Tera template syntax in mise.toml
+    # (see docs/USER_GUIDE.md):
+    #   _.python.venv = {
+    #     path = ".venv{% if env.YOLO_VENV_SUFFIX %}-{{ env.YOLO_VENV_SUFFIX }}{% endif %}",
+    #     create = true
+    #   }
+    # Empty on host → ``.venv``; "jail" inside → ``.venv-jail``.
+    run_cmd.extend(["-e", "YOLO_VENV_SUFFIX=jail"])
 
     # Mount merged skills directories read-only (prepared on host side).
     # Kernel-enforced :ro — agents get "Read-only file system" on write attempts.

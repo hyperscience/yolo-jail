@@ -1893,6 +1893,49 @@ class TestRunIdentityEnvCollection:
             assert "YOLO_GIT_EMAIL=test@example.com" in cmd_str
 
 
+    @patch("subprocess.Popen")
+    @patch("cli.run_cmd.auto_load_image")
+    @patch("cli.run_cmd._check_config_changes", return_value=True)
+    @patch("cli.run_cmd.find_running_container", return_value=None)
+    @patch("subprocess.run")
+    @patch("subprocess.check_output")
+    @patch("shutil.which")
+    def test_injects_yolo_venv_suffix(
+        self,
+        mock_which,
+        mock_check_output,
+        mock_run,
+        mock_find,
+        mock_config_changes,
+        mock_auto_load,
+        mock_popen,
+        tmp_path,
+        monkeypatch,
+    ):
+        """yolo run injects YOLO_VENV_SUFFIX=jail so .mise.toml entries
+        like ``path = ".venv${YOLO_VENV_SUFFIX:+-${YOLO_VENV_SUFFIX}}"``
+        produce ``.venv-jail`` inside (and ``.venv`` on the host).  This
+        keeps host-built and jail-built venvs in separate directories
+        so they don't overwrite each other."""
+        _run_monkeypatch(monkeypatch, tmp_path)
+        _mock_runtimes(mock_which)
+        (tmp_path / "yolo-jail.jsonc").write_text("{}")
+
+        mock_check_output.side_effect = FileNotFoundError
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        runner = CliRunner()
+        runner.invoke(app, ["run", "--", "echo", "hello"])
+
+        assert mock_popen.called
+        run_cmd = mock_popen.call_args[0][0]
+        cmd_str = " ".join(str(a) for a in run_cmd)
+        assert "YOLO_VENV_SUFFIX=jail" in cmd_str
+
+
 class TestRunYoloInjection:
     """Test run() injects --yolo for gemini/copilot commands."""
 

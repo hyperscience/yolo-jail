@@ -673,27 +673,23 @@ _uv=$(mise which uv 2>/dev/null) || exit 0
 _py=$(mise which python 2>/dev/null) || exit 0
 [ -n "$_uv" ] && [ -n "$_py" ] || exit 0
 
-# Parse venv path from mise.toml
-_vp=$(/bin/python3 -c "
-import tomllib, sys
-try:
-    c = tomllib.load(open('/workspace/mise.toml', 'rb'))
-    v = c.get('env', {}).get('_.python.venv', {})
-    if isinstance(v, dict):
-        if v.get('create', False):
-            print(v.get('path', '.venv'))
-        else:
-            sys.exit(1)
-    elif isinstance(v, str):
-        print(v)
-    else:
-        sys.exit(1)
-except Exception:
-    sys.exit(1)
-" 2>/dev/null) || exit 0
+# Ask mise for the resolved venv path — mise expands ${VAR} references
+# in the TOML config (including YOLO_VENV_SUFFIX, which yolo run injects
+# into the jail so projects can use ``.venv${YOLO_VENV_SUFFIX:+-${YOLO_VENV_SUFFIX}}``
+# to keep host and jail venvs separate).  ``mise env`` prints VIRTUAL_ENV
+# when _.python.venv is configured.
+_vp=$(cd /workspace && mise env 2>/dev/null | sed -n 's/^export VIRTUAL_ENV=//p' | tr -d '"')
+[ -n "$_vp" ] || exit 0
 
-[ -d "/workspace/$_vp" ] && exit 0
-"$_uv" venv "/workspace/$_vp" --python "$_py" 2>/dev/null || true
+# mise emits an absolute VIRTUAL_ENV; only act on workspace-rooted paths
+# so we don't accidentally pre-create venvs elsewhere on the filesystem.
+case "$_vp" in
+    /workspace/*) ;;
+    *) exit 0 ;;
+esac
+
+[ -d "$_vp" ] && exit 0
+"$_uv" venv "$_vp" --python "$_py" 2>/dev/null || true
 """)
     script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC)
 

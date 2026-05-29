@@ -550,6 +550,21 @@ To inject tools into all jails globally, use `mise_tools` in your config:
 }
 ```
 
+### Python venvs — keep host and jail separate
+
+If your project's `mise.toml` enables a managed Python venv with `create = true`, the venv directory is bind-mounted between host and jail. Both sides have *different* Python binaries (macOS Mach-O on the host, Linux ELF in the jail), so they will overwrite each other's venv whichever ran most recently — the loser ends up with broken symlinks pointing at paths that don't exist on its side.
+
+YOLO Jail injects `YOLO_VENV_SUFFIX=jail` into every jail's environment. Use it in `.mise.toml` to give the host and the jail their own venv directories. mise expands [Tera](https://mise.jdx.dev/templates.html) templates in config values, so:
+
+```toml
+[env]
+_.python.venv = { path = ".venv{% if env.YOLO_VENV_SUFFIX %}-{{ env.YOLO_VENV_SUFFIX }}{% endif %}", create = true }
+```
+
+The `{% if %}` block expands to `-jail` only when `YOLO_VENV_SUFFIX` is set — empty on the host, `-jail` inside the jail. The host gets `.venv`, the jail gets `.venv-jail`. Both paths persist across sessions; neither overwrites the other. Add both to `.gitignore`.
+
+Note: mise does **not** expand POSIX shell parameter syntax like `${VAR:+...}` or even bare `${VAR}` in `_.python.venv.path` — it expects Tera template syntax (`{{ env.VAR }}` / `{% if %}`). Don't mix the two.
+
 ---
 
 ## Blocked Tools
