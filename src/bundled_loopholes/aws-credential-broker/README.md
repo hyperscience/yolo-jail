@@ -9,7 +9,14 @@ Routes AWS credentials into jails without copying long-lived keys. The host daem
 
 ## Configuration
 
-Create `~/.config/yolo-jail/aws-broker.jsonc`:
+For most Bedrock setups **no broker config is needed** — the daemon
+auto-detects `AWS_PROFILE` and `AWS_REGION` from your host's
+`~/.claude/settings.json` env block (the same place Claude Code's
+`/setup-bedrock` wizard writes them).  Run `yolo-aws-credential-broker
+--self-check` to see what it resolved.
+
+To override or add settings absent from `~/.claude/settings.json`,
+create `~/.config/yolo-jail/aws-broker.jsonc`:
 
 ```jsonc
 {
@@ -22,7 +29,18 @@ Create `~/.config/yolo-jail/aws-broker.jsonc`:
 }
 ```
 
-If the file is missing the daemon falls back to `AWS_PROFILE` from the host environment plus a 1h default session duration.
+Resolution order (highest priority first):
+
+1. Explicit value in `~/.config/yolo-jail/aws-broker.jsonc`.
+2. Host's `~/.claude/settings.json` env block (`AWS_PROFILE`, `AWS_REGION`).
+3. Broker process environment (e.g. `AWS_PROFILE` set in the shell that
+   spawned `yolo`).
+4. AWS SDK default chain.
+
+This means a default-shell `AWS_PROFILE` that's incompatible with
+Bedrock (a common SSO-only profile, for instance) won't override the
+Bedrock-specific profile pinned in `settings.json` — matching what
+Claude Code itself does on the host.
 
 ## TTL contract
 

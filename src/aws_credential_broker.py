@@ -100,13 +100,59 @@ def _resolve_duration(cfg: Dict[str, Any]) -> int:
     return max(STS_MIN_DURATION_S, min(STS_MAX_DURATION_S, d))
 
 
+HOST_CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
+
+
+def _claude_settings_env(key: str) -> Optional[str]:
+    """Read ``key`` from the host's ~/.claude/settings.json `env` block.
+
+    Bedrock setups commonly write AWS_PROFILE / AWS_REGION there via
+    Claude Code's ``/setup-bedrock`` wizard.  Mirroring those into the
+    jail's broker means the host's existing Bedrock config Just Works
+    without a separate aws-broker.jsonc file.  Returns None if the
+    file is missing, unreadable, or doesn't carry the key.
+    """
+    try:
+        if not HOST_CLAUDE_SETTINGS.is_file():
+            return None
+        data = json.loads(HOST_CLAUDE_SETTINGS.read_text())
+    except (OSError, ValueError):
+        return None
+    env = data.get("env")
+    if not isinstance(env, dict):
+        return None
+    val = env.get(key)
+    return val if isinstance(val, str) and val else None
+
+
 def _resolve_profile(cfg: Dict[str, Any]) -> Optional[str]:
-    return cfg.get("profile") or os.environ.get("AWS_PROFILE")
+    """Pick the AWS profile, in priority order:
+
+    1. Explicit ``profile`` in ``~/.config/yolo-jail/aws-broker.jsonc``
+       (highest precedence — operator override).
+    2. ``AWS_PROFILE`` from the host's ``~/.claude/settings.json`` env
+       block — what the user already wired for host Claude Code's
+       Bedrock flow.
+    3. ``AWS_PROFILE`` from the broker daemon's process environment.
+
+    Skipping (3) when (2) is present matters because users sometimes
+    have a default ``AWS_PROFILE`` exported in their shell that
+    interferes with Bedrock auth (e.g. an SSO-only profile that
+    refuses long-lived sessions); their ``settings.json`` workaround
+    is to pin ``AWS_PROFILE=bedrock`` there.  We honor that pin.
+    """
+    return (
+        cfg.get("profile")
+        or _claude_settings_env("AWS_PROFILE")
+        or os.environ.get("AWS_PROFILE")
+    )
 
 
 def _resolve_region(cfg: Dict[str, Any]) -> Optional[str]:
+    """Pick the AWS region, same priority order as the profile."""
     return (
         cfg.get("region")
+        or _claude_settings_env("AWS_REGION")
         or os.environ.get("AWS_REGION")
         or os.environ.get("AWS_DEFAULT_REGION")
     )
@@ -324,9 +370,28 @@ def _self_check() -> int:
     region = _resolve_region(cfg)
     duration = _resolve_duration(cfg)
     role = _resolve_role_arn(cfg)
+
+    def _profile_source() -> str:
+        if cfg.get("profile"):
+            return f"from {CONFIG_PATH}"
+        if _claude_settings_env("AWS_PROFILE"):
+            return f"from {HOST_CLAUDE_SETTINGS} (env block)"
+        if os.environ.get("AWS_PROFILE"):
+            return "from broker process AWS_PROFILE"
+        return "(unresolved — AWS SDK default chain)"
+
+    def _region_source() -> str:
+        if cfg.get("region"):
+            return f"from {CONFIG_PATH}"
+        if _claude_settings_env("AWS_REGION"):
+            return f"from {HOST_CLAUDE_SETTINGS} (env block)"
+        if os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"):
+            return "from broker process env"
+        return "(unresolved — aws CLI default)"
+
     print(f"config: {CONFIG_PATH} ({'present' if CONFIG_PATH.exists() else 'absent'})")
-    print(f"profile: {profile or '(none — using default chain)'}")
-    print(f"region:  {region or '(none — aws CLI default)'}")
+    print(f"profile: {profile or '(none)'}  [{_profile_source()}]")
+    print(f"region:  {region or '(none)'}  [{_region_source()}]")
     print(f"duration: {duration}s (clamped to STS bounds)")
     print(f"role_arn: {role or '(none — sts:GetSessionToken)'}")
     cached = _read_cache()

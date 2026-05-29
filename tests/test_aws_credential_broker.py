@@ -177,6 +177,91 @@ def test_aws_argv_includes_profile_and_region(tmp_state):
     assert argv[-2:] == ["--output", "json"]
 
 
+# --- Profile / region resolution precedence ---
+
+
+def test_resolve_profile_explicit_config_wins(tmp_state, monkeypatch):
+    """A profile in aws-broker.jsonc beats every other source."""
+    tmp, _, _ = tmp_state
+    settings = tmp / "claude-settings.json"
+    settings.write_text(json.dumps({"env": {"AWS_PROFILE": "from-claude"}}))
+    monkeypatch.setattr(ab, "HOST_CLAUDE_SETTINGS", settings)
+    monkeypatch.setenv("AWS_PROFILE", "from-shell")
+    assert ab._resolve_profile({"profile": "from-cfg"}) == "from-cfg"
+
+
+def test_resolve_profile_falls_back_to_claude_settings(tmp_state, monkeypatch):
+    """When aws-broker.jsonc has no profile, read host Claude settings."""
+    tmp, _, _ = tmp_state
+    settings = tmp / "claude-settings.json"
+    settings.write_text(json.dumps({"env": {"AWS_PROFILE": "from-claude"}}))
+    monkeypatch.setattr(ab, "HOST_CLAUDE_SETTINGS", settings)
+    monkeypatch.setenv("AWS_PROFILE", "from-shell")
+    assert ab._resolve_profile({}) == "from-claude"
+
+
+def test_resolve_profile_settings_overrides_shell(tmp_state, monkeypatch):
+    """Crucially: a Bedrock-pinned AWS_PROFILE in ~/.claude/settings.json
+    must beat a default AWS_PROFILE exported in the shell.  Real-world
+    case: the user's default shell profile is SSO-only and refuses STS
+    long-lived sessions; their Bedrock fix is to pin AWS_PROFILE=bedrock
+    in settings.json."""
+    tmp, _, _ = tmp_state
+    settings = tmp / "claude-settings.json"
+    settings.write_text(json.dumps({"env": {"AWS_PROFILE": "bedrock"}}))
+    monkeypatch.setattr(ab, "HOST_CLAUDE_SETTINGS", settings)
+    monkeypatch.setenv("AWS_PROFILE", "hs-qa-svet")  # the conflicting default
+    assert ab._resolve_profile({}) == "bedrock"
+
+
+def test_resolve_profile_falls_back_to_shell(tmp_state, monkeypatch):
+    """No config and no Claude settings → fall back to shell AWS_PROFILE."""
+    tmp, _, _ = tmp_state
+    monkeypatch.setattr(ab, "HOST_CLAUDE_SETTINGS", tmp / "absent.json")
+    monkeypatch.setenv("AWS_PROFILE", "from-shell")
+    assert ab._resolve_profile({}) == "from-shell"
+
+
+def test_resolve_profile_returns_none_when_unresolvable(tmp_state, monkeypatch):
+    tmp, _, _ = tmp_state
+    monkeypatch.setattr(ab, "HOST_CLAUDE_SETTINGS", tmp / "absent.json")
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    assert ab._resolve_profile({}) is None
+
+
+def test_resolve_region_uses_claude_settings(tmp_state, monkeypatch):
+    """Region falls back to ~/.claude/settings.json env block too."""
+    tmp, _, _ = tmp_state
+    settings = tmp / "claude-settings.json"
+    settings.write_text(json.dumps({"env": {"AWS_REGION": "us-west-2"}}))
+    monkeypatch.setattr(ab, "HOST_CLAUDE_SETTINGS", settings)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    assert ab._resolve_region({}) == "us-west-2"
+
+
+def test_claude_settings_env_handles_missing_file(tmp_state, monkeypatch):
+    tmp, _, _ = tmp_state
+    monkeypatch.setattr(ab, "HOST_CLAUDE_SETTINGS", tmp / "nope.json")
+    assert ab._claude_settings_env("AWS_PROFILE") is None
+
+
+def test_claude_settings_env_handles_malformed_json(tmp_state, monkeypatch):
+    tmp, _, _ = tmp_state
+    bad = tmp / "bad.json"
+    bad.write_text("{ not json")
+    monkeypatch.setattr(ab, "HOST_CLAUDE_SETTINGS", bad)
+    assert ab._claude_settings_env("AWS_PROFILE") is None
+
+
+def test_claude_settings_env_handles_missing_env_block(tmp_state, monkeypatch):
+    tmp, _, _ = tmp_state
+    settings = tmp / "no-env.json"
+    settings.write_text(json.dumps({"model": "us.anthropic.claude-opus-4-7"}))
+    monkeypatch.setattr(ab, "HOST_CLAUDE_SETTINGS", settings)
+    assert ab._claude_settings_env("AWS_PROFILE") is None
+
+
 def test_assume_role_argv_uses_role_arn(tmp_state, monkeypatch):
     """Sanity-check the argv shape for the AssumeRole branch.  Asserts
     that the daemon emits ``aws sts assume-role --role-arn ...
